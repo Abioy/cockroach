@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -21,74 +21,43 @@ import (
 	"fmt"
 	"testing"
 	"time"
-	"github.com/golang/glog"
+
+	"github.com/cockroachdb/cockroach/gossip/resolver"
+	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
-const (
-	// Compressed simulation time scale for testing.
-	testGossipInterval = time.Millisecond * 10
-)
-
-// isNetworkConnected returns true if the network is fully connected with
-// no partitions.
-func isNetworkConnected(nodes map[string]*Gossip) bool {
-	for _, node := range nodes {
-		for infoKey := range nodes {
-			_, err := node.GetInfo(infoKey)
-			if err != nil {
-				glog.Infof("error: %v", err)
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// verifyConvergence verifies that info from each node is visible from
-// every node in the network within numCycles cycles of the gossip protocol.
-func verifyConvergence(numNodes, maxCycles int, t *testing.T) {
-	var connectedAtCycle int
-	SimulateNetwork(numNodes, "unix", testGossipInterval, func(cycle int, nodes map[string]*Gossip) bool {
-		// Every node should gossip.
-		for addr, node := range nodes {
-			node.AddInfo(addr, int64(cycle), time.Hour)
-		}
-		if isNetworkConnected(nodes) {
-			connectedAtCycle = cycle
-			return false
-		}
-		return true
-	})
-
-	if connectedAtCycle > maxCycles {
-		t.Errorf("expected a fully-connected network within 5 cycles; took %d", connectedAtCycle)
-	}
-}
-
-// TestConvergence verifies a 10 node gossip network
-// converges within 5 cycles.
-func TestConvergence(t *testing.T) {
-	verifyConvergence(10, 5, t)
-}
+var rootTestBaseContext = testutils.NewRootTestBaseContext()
+var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
-	g := New()
-	g.AddInfo("i", int64(1), time.Hour)
+	defer leaktest.AfterTest(t)
+	rpcContext := rpc.NewContext(rootTestBaseContext, hlc.NewClock(hlc.UnixNano), nil)
+	g := New(rpcContext, TestInterval, TestBootstrap)
+	if err := g.AddInfo("i", int64(1), time.Hour); err != nil {
+		t.Fatal(err)
+	}
 	if val, err := g.GetInfo("i"); val.(int64) != int64(1) || err != nil {
 		t.Errorf("error fetching int64: %v", err)
 	}
 	if _, err := g.GetInfo("i2"); err == nil {
 		t.Errorf("expected error fetching nonexistent key \"i2\"")
 	}
-	g.AddInfo("f", float64(3.14), time.Hour)
+	if err := g.AddInfo("f", float64(3.14), time.Hour); err != nil {
+		t.Fatal(err)
+	}
 	if val, err := g.GetInfo("f"); val.(float64) != float64(3.14) || err != nil {
 		t.Errorf("error fetching float64: %v", err)
 	}
 	if _, err := g.GetInfo("f2"); err == nil {
 		t.Errorf("expected error fetching nonexistent key \"f2\"")
 	}
-	g.AddInfo("s", "b", time.Hour)
+	if err := g.AddInfo("s", "b", time.Hour); err != nil {
+		t.Fatal(err)
+	}
 	if val, err := g.GetInfo("s"); val.(string) != "b" || err != nil {
 		t.Errorf("error fetching string: %v", err)
 	}
@@ -100,12 +69,18 @@ func TestGossipInfoStore(t *testing.T) {
 // TestGossipGroupsInfoStore verifies gossiping of groups via the
 // gossip instance infostore.
 func TestGossipGroupsInfoStore(t *testing.T) {
-	g := New()
+	defer leaktest.AfterTest(t)
+	rpcContext := rpc.NewContext(rootTestBaseContext, hlc.NewClock(hlc.UnixNano), nil)
+	g := New(rpcContext, TestInterval, TestBootstrap)
 
 	// For int64.
-	g.RegisterGroup("i", 3, MinGroup)
+	if err := g.RegisterGroup("i", 3, MinGroup); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("i.%d", i), int64(i), time.Hour)
+		if err := g.AddInfo(fmt.Sprintf("i.%d", i), int64(i), time.Hour); err != nil {
+			t.Fatal(err)
+		}
 	}
 	values, err := g.GetGroupInfos("i")
 	if err != nil {
@@ -124,9 +99,13 @@ func TestGossipGroupsInfoStore(t *testing.T) {
 	}
 
 	// For float64.
-	g.RegisterGroup("f", 3, MinGroup)
+	if err := g.RegisterGroup("f", 3, MinGroup); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("f.%d", i), float64(i), time.Hour)
+		if err := g.AddInfo(fmt.Sprintf("f.%d", i), float64(i), time.Hour); err != nil {
+			t.Fatal(err)
+		}
 	}
 	values, err = g.GetGroupInfos("f")
 	if err != nil {
@@ -142,9 +121,13 @@ func TestGossipGroupsInfoStore(t *testing.T) {
 	}
 
 	// For string.
-	g.RegisterGroup("s", 3, MinGroup)
+	if err := g.RegisterGroup("s", 3, MinGroup); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("s.%d", i), fmt.Sprintf("%d", i), time.Hour)
+		if err := g.AddInfo(fmt.Sprintf("s.%d", i), fmt.Sprintf("%d", i), time.Hour); err != nil {
+			t.Fatal(err)
+		}
 	}
 	values, err = g.GetGroupInfos("s")
 	if err != nil {
@@ -156,6 +139,53 @@ func TestGossipGroupsInfoStore(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if values[i].(string) != fmt.Sprintf("%d", i) {
 			t.Errorf("index %d has incorrect value: %d, expected %s", i, values[i], fmt.Sprintf("%d", i))
+		}
+	}
+}
+
+func TestGossipGetNextBootstrapAddress(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	resolverSpecs := []string{
+		"127.0.0.1:9000",
+		"tcp=127.0.0.1:9001",
+		"unix=/tmp/unix-socket12345",
+		"lb=127.0.0.1:9002",
+		"foo=127.0.0.1:9003", // error should not resolve.
+		"lb=",                // error should not resolve.
+		"localhost:9004",
+		"lb=127.0.0.1:9005",
+	}
+
+	resolvers := []resolver.Resolver{}
+	for _, rs := range resolverSpecs {
+		resolver, err := resolver.NewResolver(nodeTestBaseContext, rs)
+		if err == nil {
+			resolvers = append(resolvers, resolver)
+		}
+	}
+	if len(resolvers) != 6 {
+		t.Errorf("expected 6 resolvers; got %d", len(resolvers))
+	}
+	g := New(nil, TestInterval, resolvers)
+
+	// Using specified resolvers, fetch bootstrap addresses 10 times
+	// and verify the results match expected addresses.
+	expAddresses := []string{
+		"127.0.0.1:9001",
+		"/tmp/unix-socket12345",
+		"127.0.0.1:9002",
+		"localhost:9004",
+		"127.0.0.1:9005",
+		"127.0.0.1:9000",
+		"127.0.0.1:9002",
+		"127.0.0.1:9005",
+		"127.0.0.1:9002",
+		"127.0.0.1:9005",
+	}
+	for i := 0; i < 10; i++ {
+		addr := g.getNextBootstrapAddress()
+		if addr.String() != expAddresses[i] {
+			t.Errorf("%d: expected addr %s; got %s", i, expAddresses[i], addr.String())
 		}
 	}
 }

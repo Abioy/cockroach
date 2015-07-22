@@ -1,39 +1,187 @@
-# Cockroach [![Build Status](https://secure.travis-ci.org/cockroachdb/cockroach.png)](http://travis-ci.org/cockroachdb/cockroach)  [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg) 
+![logo](/resource/doc/cockroach_db.png?raw=true "Cockroach Labs logo")
 
-A Scalable, Geo-Replicated, Transactional Datastore
+
+[![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg)
+
+## A Scalable, Geo-Replicated, Transactional Datastore
+
+**Table of Contents**
+
+- [Status](#status)
+- [Running Cockroach Locally](#running-cockroach-locally)
+- [Deploying Cockroach in production](#deploying-cockroach-in-production)
+- [Getting in touch and contributing](#get-in-touch)
+- [Talks](#talks)
+- [Design](#design) and [Datastore Goal Articulation](#datastore-goal-articulation)
+- [Architecture](#architecture) and [Client Architecture](#client-architecture)
+
+[![WIRED on CockroachDB](/resource/doc/wired-preview.png?raw=true)](http://www.wired.com/2014/07/cockroachdb/)
 
 ## Status
 
-**ALPHA**
+See our
+[Roadmap](https://github.com/cockroachdb/cockroach/wiki/Roadmap) and
+[Issues](https://github.com/cockroachdb/cockroach/issues)
 
-* Gossip network
-* Cluster initialization and joining
-* Basic Key-Value REST API
-* NO: Raft consensus, range splitting, transactions (!)
+## Running Cockroach Locally
 
-## Simple Setup
+Getting started is most convenient using a recent version (>1.2) of [Docker](http://docs.docker.com/installation/).
 
-* node1> ./cockroach init hdd=\<path>
-* node1> ./cockroach start -gossip=:8081 -rpc_addr=:8081 -http_adr=:8080 -stores=hdd=\<path>
+If you don't want to use Docker,
+* set up the dev environment (see [CONTRIBUTING.md](CONTRIBUTING.md))
+* `make build`
+* ignore the initial calls to `docker` below.
 
-* node2> ./cockroach start -gossip=node1:8081 -http_adr=:8080 -stores=hdd=\<path>
+#### Bootstrap and talk to a single node
 
-## Next Steps
+Getting a Cockroach node up and running is easy. If you have the `cockroach` binary, skip over the next shell session. Most users however will want to run the following:
 
-See [TODO](https://github.com/cockroachdb/cockroach/blob/master/TODO)
+```bash
+# Get the latest image from the registry. Skip if you already have an image
+# or if you built it yourself.
+docker pull cockroachdb/cockroach
+# Open a shell on a Cockroach container.
+docker run -t -i -p 8080:8080 cockroachdb/cockroach shell
+# root@82cb657cdc42:/cockroach#
+```
+
+If the docker command fails but Docker is installed, you probably need to initialize it. Here's a common error message:
+```bash
+FATA[0000] Post http:///var/run/docker.sock/v1.17/images/create?fromImage=cockroachdb%2Fcockroach%3Alatest: dial unix /var/run/docker.sock: no such file or directory
+```
+On OSX:
+```bash
+# Setup Boot2Docker. This should only need to be done once.
+boot2docker init
+# Start Boot2Docker. This will need to be run once per reboot.
+boot2docker start
+# Setup environment variables. This will need to be run once per shell.
+$(boot2docker shellinit)
+```
+Other operating systems will have a similar set of commands. Please check Docker's documentation for more info.
+
+
+Now we're in an environment that has everything set up, and we start by first initializing the cluster and then firing up the node:
+
+```bash
+DIR=$(mktemp -d /tmp/dbXXX)
+# Initialize CA, server, and client certificates. Default directory is --certs=certs
+./cockroach cert create-ca
+./cockroach cert create-node 127.0.0.1 localhost $(hostname)
+./cockroach cert create-client root
+# Initialize data directories.
+./cockroach init --stores=ssd=$DIR
+# Start the server.
+./cockroach start --stores=ssd="$DIR" --gossip=self= &
+```
+This initializes and starts a single-node cluster in the background.
+
+##### Built-in client
+
+Now let's talk to this node. The easiest way to do that is to use the `cockroach` binary - it comes with a simple built-in client:
+
+```bash
+# Put the values a->1, b->2, c->3, d->4.
+./cockroach kv put a 1 b 2 c 3 d 4
+./cockroach kv scan
+# "a"     1
+# "b"     2
+# "c"     3
+# "d"     4
+# Scans do not include the end key.
+./cockroach kv scan b d
+# "b"     2
+# "c"     3
+./cockroach kv del c
+./cockroach kv scan
+# "a"     1
+# "b"     2
+# "d"     4
+# Counters are also available:
+./cockroach kv inc mycnt 5
+# 5
+./cockroach kv inc mycnt -3
+#2
+./cockroach kv get mycnt
+#2
+```
+
+Check out `./cockroach help` to see all available commands.
+
+#### Building the Docker images yourself
+See [build/README.md](build/) for more information on the available Docker
+images `cockroachdb/cockroach` and `cockroachdb/cockroach-dev`.
+You can build both of these images yourself:
+
+* `cockroachdb/cockroach-dev`: `(cd build ; ./build-docker-dev.sh)`
+* `cockroachdb/cockroach`: `(cd build ; ./build-docker-deploy.sh)`
+  (this will build the first image as well)
+
+Once you've built your image, you may want to run the tests:
+* `docker run "cockroachdb/cockroach-dev" test`
+* `make acceptance`
+
+Assuming you've built `cockroachdb/cockroach`, let's run a simple Cockroach node:
+
+```bash
+docker run -v /data -v /certs cockroachdb/cockroach init --stores=ssd=/data
+docker run --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach \
+  cert create-ca --certs=/certs
+docker run --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach \
+  cert create-node --certs=/certs 127.0.0.1 localhost roachnode
+docker run --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach \
+  cert create-client root
+docker run -p 8080:8080 -h roachnode --volumes-from=$(docker ps -q -n 1) \
+  cockroachdb/cockroach start --certs=/certs --stores=ssd=/data --gossip=self=
+```
+
+Run `docker run cockroachdb/cockroach help` to get an overview over the available commands and settings, and see [Running Cockroach](#running-cockroach) for first steps on interacting with your new node.
+
+
+## Deploying Cockroach in production
+
+To run a cockroach cluster on various cloud platforms using [docker machine](http://docs.docker.com/machine/),
+see [cockroach-prod](https://github.com/cockroachdb/cockroach-prod)
+
 
 ## Get in touch
 
-+ cockroach-db@googlegroups.com
-+ \#cockroachdb on freenode
+We spend almost all of our time here on GitHub, and use the [issue
+tracker](https://github.com/cockroachdb/cockroach/issues) for
+bug reports and development-related questions.
 
-## Contributing
+For anything else, message our mailing list at [cockroach-db@googlegroups.com](https://groups.google.com/forum/#!forum/cockroach-db). We recommend joining before posting, or your messages may be held back for moderation.
 
-See [CONTRIBUTING.md](https://github.com/cockroachdb/cockroach/blob/master/CONTRIBUTING.md)
+### Contributing
+
+We're an Open Source project and welcome contributions.
+See [CONTRIBUTING.md](https://github.com/cockroachdb/cockroach/blob/master/CONTRIBUTING.md) to get your local environment set up.
+Once that's done, take a look at our [open issues](https://github.com/cockroachdb/cockroach/issues/), in particular those with the [helpwanted label](https://github.com/cockroachdb/cockroach/labels/helpwanted), and follow our [code reviews](https://github.com/cockroachdb/cockroach/pulls/) to learn about our style and conventions.
+
+## Talks
+
+* [Venue: Data Driven NYC](https://youtu.be/TA-Jw78Ms_4), by [Spencer Kimball] (https://github.com/spencerkimball) on (06/16/2015), 23min.<br />
+  A short, less technical presentation of Cockroach.
+* [Venue: NY Enterprise Technology Meetup](https://www.youtube.com/watch?v=SXAEZlpsHNE), by [Tobias Schottdorf](https://github.com/tschottdorf) on (06/10/2015), 15min.<br />
+  A short, non-technical talk with a small cluster survivability demo.
+* [Venue: CoreOS Fest](https://www.youtube.com/watch?v=LI7uaaYeYmQ), by [Spencer Kimball](https://github.com/spencerkimball) on (05/27/2015), 25min.<br />
+  An introduction to the goals and design of Cockroach DB. The recommended talk to watch if all you have time for is one.
+* [Venue: The Go Devroom FOSDEM 2015](https://www.youtube.com/watch?v=ndKj77VW2eM&index=2&list=PLtLJO5JKE5YDK74RZm67xfwaDgeCj7oqb), by [Tobias Schottdorf](https://github.com/tschottdorf) on (03/04/2015), 45min.<br />
+  The most technical talk given thus far, going through the implementation of transactions in some detail.
+
+### Older talks
+
+* [Venue: The NoSQL User Group Cologne](https://www.youtube.com/watch?v=jI3LiKhqN0E), by [Tobias Schottdorf](https://github.com/tschottdorf) on (11/5/2014), 1h25min.
+* [Venue: Yelp!](http://www.youtube.com/watch?v=MEAuFgsmND0&feature=youtu.be), by [Spencer Kimball](https://github.com/spencerkimball) on (9/5/2014), 1h.
+
 
 ## Design
 
-For full design details, see the [original design doc](https://docs.google.com/document/d/11k2EmhLGSbViBvi6_zFEiKzuXxYF49ZuuDJLe6O8gBU/edit?usp=sharing).
+This is an overview. For an in depth discussion of the design, see the [design doc](https://github.com/cockroachdb/cockroach/blob/master/docs/design.md).
+
+For a quick design overview, see the [Cockroach tech talk slides](https://docs.google.com/presentation/d/1e3TOxImRg6_nyMZspXvzb2u43D6gnS5422vAIN7J1n8/edit?usp=sharing)
+or watch a [presentation](#talks).
+
 
 Cockroach is a distributed key/value datastore which supports ACID
 transactional semantics and versioned values as first-class
@@ -96,7 +244,74 @@ communication between distributed system components.
 
 #### SQL - NoSQL - NewSQL Capabilities
 
-![SQL - NoSQL - NewSQL Capabilities](/resources/doc/sql-nosql-newsql.png?raw=true)
+![SQL - NoSQL - NewSQL Capabilities](/resource/doc/sql-nosql-newsql.png?raw=true)
+
+## Datastore Goal Articulation
+
+There are other important axes involved in data-stores which are less
+well understood and/or explained. There is lots of cross-dependency,
+but it's safe to segregate two more of them as (a) scan efficiency,
+and (b) read vs write optimization.
+
+#### Datastore Scan Efficiency Spectrum
+
+Scan efficiency refers to the number of IO ops required to scan a set
+of sorted adjacent rows matching a criteria. However, it's a
+complicated topic, because of the options (or lack of options) for
+controlling physical order in different systems.
+
+* Some designs either default to or only support "heap organized"
+  physical records (Oracle, MySQL, Postgres, SQLite, MongoDB). In this
+  design, a naive sorted-scan of an index involves one IO op per
+  record.
+* In these systems it's possible to "fully cover" a sorted-query in an
+  index with some write-amplification.
+* In some systems it's possible to put the primary record data in a
+  sorted btree instead of a heap-table (default in MySQL/Innodb,
+  option in Oracle).
+* Sorted-order LSM NoSQL could be considered index-organized-tables,
+  with efficient scans by the row-key. (HBase).
+* Some NoSQL is not optimized for sorted-order retrieval, because of
+  hash-bucketing, primarily based on the Dynamo design. (Cassandra,
+  Riak)
+
+![Datastore Scan Efficiency Spectrum](/resource/doc/scan-efficiency.png?raw=true)
+
+#### Read vs. Write Optimization Spectrum
+
+Read vs write optimization is a product of the underlying sorted-order
+data-structure used. Btrees are read-optimized. Hybrid write-deferred
+trees are a balance of read-and-write optimizations (shuttle-trees,
+fractal-trees, stratified-trees). LSM separates write-incorporation
+into a separate step, offering a tunable amount of read-to-write
+optimization. An "ideal" LSM at 0%-write-incorporation is a log, and
+at 100%-write-incorporation is a btree.
+
+The topic of LSM is confused by the fact that LSM is not an algorithm,
+but a design pattern, and usage of LSM is hindered by the lack of a
+de-facto optimal LSM design. LevelDB/RocksDB is one of the more
+practical LSM implementations, but it is far from optimal. Popular
+text-indicies like Lucene are non-general purpose instances of
+write-optimized LSM.
+
+Further, there is a dependency between access pattern
+(read-modify-write vs blind-write and write-fraction), cache-hitrate,
+and ideal sorted-order algorithm selection. At a certain
+write-fraction and read-cache-hitrate, systems achieve higher total
+throughput with write-optimized designs, at the cost of increased
+worst-case read latency. As either write-fraction or
+read-cache-hitrate approaches 1.0, write-optimized designs provide
+dramatically better sustained system throughput when record-sizes are
+small relative to IO sizes.
+
+Given this information, data-stores can be sliced by their
+sorted-order storage algorithm selection. Btree stores are
+read-optimized (Oracle, SQLServer, Postgres, SQLite2, MySQL, MongoDB,
+CouchDB), hybrid stores are read-optimized with better
+write-throughput (Tokutek MySQL/MongoDB), while LSM-variants are
+write-optimized (HBase, Cassandra, SQLite3/LSM, Cockroach).
+
+![Read vs. Write Optimization Spectrum](/resource/doc/read-vs-write.png?raw=true)
 
 ## Architecture
 
@@ -113,7 +328,7 @@ with any number of [cockroach nodes][9] ([server/][10]), storing the actual
 data. Each node contains one or more [stores][11] ([storage/][12]), one per
 physical device.
 
-![Cockroach Architecture](/resources/doc/architecture.png?raw=true)
+![Cockroach Architecture](/resource/doc/architecture.png?raw=true)
 
 Each store contains potentially many ranges, the lowest-level unit of
 key-value data. Ranges are replicated using the [Raft][2] consensus
@@ -122,7 +337,39 @@ of the five nodes in the previous diagram. Each range is replicated
 three ways using raft. The color coding shows associated range
 replicas.
 
-![Range Architecture Blowup](/resources/doc/architecture-blowup.png?raw=true)
+![Range Architecture Blowup](/resource/doc/architecture-blowup.png?raw=true)
+
+## Client Architecture
+
+Cockroach nodes serve client traffic using a fully-featured key/value
+DB API which accepts requests as either application/x-protobuf or
+application/json. Client implementations consist of an HTTP sender
+(transport) and a transactional sender which implements a simple
+exponential backoff / retry protocol, depending on Cockroach error
+codes.
+
+The DB client gateway accepts incoming requests and sends them
+through a transaction coordinator, which handles transaction
+heartbeats on behalf of clients, provides optimization pathways, and
+resolves write intents on transaction commit or abort. The transaction
+coordinator passes requests onto a distributed sender, which looks up
+index metadata, caches the results, and routes internode RPC traffic
+based on where the index metadata indicates keys are located in the
+distributed cluster.
+
+In addition to the gateway for external DB client traffic, each Cockroach
+node provides the full key/value API (including all internal methods) via
+a Go RPC server endpoint. The RPC server endpoint forwards requests to one
+or more local stores depending on the specified key range.
+
+Internally, each Cockroach node uses the Go implementation of the
+Cockroach client in order to transactionally update system key/value
+data; for example during split and merge operations to update index
+metadata records. Unlike an external application, the internal client
+eschews the HTTP sender and instead directly shares the transaction
+coordinator and distributed sender used by the DB client gateway.
+
+![Client Architecture](/resource/doc/client-architecture.png?raw=true)
 
 [0]: http://rocksdb.org/
 [1]: https://code.google.com/p/leveldb/

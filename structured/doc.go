@@ -9,18 +9,21 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /*
+
 Package structured provides a high-level API for application access to
 an underlying cockroach datastore. Cockroach itself provides a single
 monolithic, sorted key-value map. Structured translates between
 familiar RDBMS concepts such as tables, columns and indexes to the
 key-value store.
+
+NOTE: THIS IS WILDLY OUT OF DATE WHILE THIS PACKAGE IS BEING REDESIGNED.
 
 Schemas
 
@@ -168,7 +171,7 @@ specifications.
   }
 
   // Get the schema from the go struct declarations.
-	sm := map[string]interface{}{
+  sm := map[string]interface{}{
     'us': User{},
     'id': Identity{},
   }

@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -19,8 +19,8 @@ package util
 
 import (
 	"fmt"
-	"path/filepath"
-	"runtime"
+
+	"github.com/cockroachdb/cockroach/util/caller"
 )
 
 const defaultSkip = 2
@@ -29,10 +29,8 @@ const errorPrefixFormat string = "%s:%d: "
 // getPrefix skips "skip" stack frames to get the file & line number
 // of original caller.
 func getPrefix(skip int, format string) string {
-	if _, file, line, ok := runtime.Caller(skip); ok {
-		return fmt.Sprintf(format, filepath.Base(file), line)
-	}
-	return ""
+	file, line, _ := caller.Lookup(skip)
+	return fmt.Sprintf(format, file, line)
 }
 
 // Errorf is a passthrough to fmt.Errorf, with an additional prefix

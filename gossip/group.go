@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 // GroupType indicates the bounds of the values encountered within the group.
@@ -59,7 +59,7 @@ type groupMap map[string]*group
 // newGroup allocates and returns a new group with prefix, limit and type.
 func newGroup(prefix string, limit int, typeOf GroupType) *group {
 	if limit <= 0 {
-		glog.Fatalf("group size limit must be a positive number (%d <= 0)", limit)
+		log.Fatalf("group size limit must be a positive number (%d <= 0)", limit)
 	}
 	return &group{
 		Prefix:      prefix,
@@ -82,7 +82,7 @@ func (g *group) shouldInclude(i *info) bool {
 	case MaxGroup:
 		return !i.less(g.gatekeeper)
 	default:
-		glog.Fatalf("unknown group type %d", g.TypeOf)
+		log.Fatalf("unknown group type %d", g.TypeOf)
 		return false
 	}
 }
@@ -123,9 +123,9 @@ func (g *group) compact() bool {
 	// Delete expired entries && update group stats.
 	g.minTTLStamp = math.MaxInt64
 	g.gatekeeper = nil
-	for key, i := range g.Infos {
-		if i.TTLStamp <= now {
-			delete(g.Infos, key)
+	for _, i := range g.Infos {
+		if i.expired(now) {
+			g.removeInternal(i)
 		} else {
 			g.updateIncremental(i)
 		}
@@ -153,7 +153,7 @@ func (g *group) getInfo(key string) *info {
 	if i, ok := g.Infos[key]; ok {
 		// Check TTL and discard if too old.
 		now := time.Now().UnixNano()
-		if i.TTLStamp <= now {
+		if i.expired(now) {
 			g.removeInternal(i)
 			return nil
 		}
@@ -171,7 +171,7 @@ func (g *group) infosAsSlice() infoSlice {
 	for _, i := range g.Infos {
 		// Check TTL and discard if too old.
 		if i.expired(now) {
-			delete(g.Infos, i.Key)
+			g.removeInternal(i)
 		} else {
 			infos = append(infos, i)
 		}
@@ -189,22 +189,29 @@ func (g *group) infosAsSlice() infoSlice {
 // or if the info has a value which guarantees it a spot within the
 // group according to the group type.
 //
-// Returns nil if the info was added; an error if the info types don't
-// match an existing group or the info was older than what we
+// Returns contentsChanged bool and an error. contentsChanged is true
+// if this info is new or updates the contents of a preexisting info
+// with the same key; if just the timestamp or number of hops changes,
+// contentsChanged is false. An error is returned if the info types
+// don't match an existing group or the info was older than what we
 // currently have.
-func (g *group) addInfo(i *info) error {
+func (g *group) addInfo(i *info) (contentsChanged bool, err error) {
 	// First, see if info is already in the group. If so, and this
-	// info timestamp is newer, remove existing info.  If the
+	// info timestamp is newer, remove existing info. If the
 	// timestamps are equal (i.e. this is the same info), but hops
 	// value of prospective info is lower, take the minimum of the two
 	// Hops values.
 	if existingInfo, ok := g.Infos[i.Key]; ok {
-		if existingInfo.Timestamp < i.Timestamp ||
-			(existingInfo.Timestamp == i.Timestamp && existingInfo.Hops > i.Hops) {
-			g.removeInternal(i)
-		} else {
-			return util.Errorf("current group info %+v newer than proposed info %+v", existingInfo, i)
+		if i.Timestamp < existingInfo.Timestamp ||
+			(i.Timestamp == existingInfo.Timestamp && i.Hops >= existingInfo.Hops) {
+			err = util.Errorf("info %+v older than current info %+v", i, existingInfo)
+			return
 		}
+		g.removeInternal(existingInfo)
+		contentsChanged = !reflect.DeepEqual(existingInfo.Val, i.Val)
+	} else {
+		// No preexisting info means contentsChanged is true.
+		contentsChanged = true
 	}
 
 	// If the group is not empty, verify types match by comparing to
@@ -213,14 +220,15 @@ func (g *group) addInfo(i *info) error {
 		t1 := reflect.TypeOf(i.Val).Kind()
 		t2 := reflect.TypeOf(g.gatekeeper.Val).Kind()
 		if t1 != t2 {
-			return util.Errorf("info %+v has type %s whereas group has type %s", i, t1, t2)
+			err = util.Errorf("info %+v has type %s whereas group has type %s", i, t1, t2)
+			return
 		}
 	}
 
 	// If there's free space or we successfully compacted, add info.
 	if len(g.Infos) < g.Limit || g.compact() {
 		g.addInternal(i)
-		return nil // Successfully appended to group
+		return
 	}
 
 	// Group limit is reached. Check gatekeeper; if we should include,
@@ -228,8 +236,9 @@ func (g *group) addInfo(i *info) error {
 	if g.shouldInclude(i) {
 		g.removeInternal(g.gatekeeper)
 		g.addInternal(i)
-		return nil
+		return
 	}
 
-	return util.Errorf("info %+v not added to group", i)
+	err = util.Errorf("info %+v not added to group", i)
+	return
 }

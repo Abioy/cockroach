@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -20,8 +20,14 @@ package gossip
 import (
 	"fmt"
 	"math"
+	"reflect"
+	"sort"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 // testAddr and emptyAddr are defined in info_test.go.
@@ -29,7 +35,8 @@ import (
 // TestRegisterGroup registers two groups and verifies operation of
 // belongsToGroup.
 func TestRegisterGroup(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 
 	groupA := newGroup("a", 1, MinGroup)
 	if is.registerGroup(groupA) != nil {
@@ -68,7 +75,8 @@ func TestRegisterGroup(t *testing.T) {
 // TestZeroDuration verifies that specifying a zero duration sets
 // TTLStamp to max int64.
 func TestZeroDuration(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	info := is.newInfo("a", float64(1), 0*time.Second)
 	if info.TTLStamp != math.MaxInt64 {
 		t.Errorf("expected zero duration to get max TTLStamp: %d", info.TTLStamp)
@@ -77,7 +85,8 @@ func TestZeroDuration(t *testing.T) {
 
 // TestNewInfo creates new info objects. Verify sequence increments.
 func TestNewInfo(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	info1 := is.newInfo("a", float64(1), time.Second)
 	info2 := is.newInfo("a", float64(1), time.Second)
 	if info1.seq != info2.seq-1 {
@@ -88,7 +97,8 @@ func TestNewInfo(t *testing.T) {
 // TestInfoStoreGetInfo adds an info, and makes sure it can be fetched
 // via getInfo. Also, verifies a non-existent info can't be fetched.
 func TestInfoStoreGetInfo(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	i := is.newInfo("a", float64(1), time.Second)
 	if err := is.addInfo(i); err != nil {
 		t.Error(err)
@@ -110,7 +120,8 @@ func TestInfoStoreGetInfo(t *testing.T) {
 // Verify TTL is respected on info fetched by key
 // and group.
 func TestInfoStoreGetInfoTTL(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	i := is.newInfo("a", float64(1), time.Nanosecond)
 	if err := is.addInfo(i); err != nil {
 		t.Error(err)
@@ -124,7 +135,8 @@ func TestInfoStoreGetInfoTTL(t *testing.T) {
 // Add infos using same key, same and lesser timestamp; verify no
 // replacement.
 func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	info1 := is.newInfo("a", float64(1), time.Second)
 	if err := is.addInfo(info1); err != nil {
 		t.Error(err)
@@ -146,7 +158,8 @@ func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
 
 // Add infos using same key, same timestamp; verify no replacement.
 func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	info1 := is.newInfo("a", float64(1), time.Second)
 	info2 := is.newInfo("a", float64(2), time.Second)
 	if err1, err2 := is.addInfo(info1), is.addInfo(info2); err1 != nil || err2 != nil {
@@ -157,7 +170,8 @@ func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
 // Verify that adding two infos with different hops but same keys
 // always chooses the minimum hops.
 func TestAddInfoSameKeyDifferentHops(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 	info1 := is.newInfo("a", float64(1), time.Second)
 	info1.Hops = 1
 	info2 := is.newInfo("a", float64(2), time.Second)
@@ -190,7 +204,8 @@ func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 // verify ordering. Add an additional non-group info and fetch that as
 // well.
 func TestAddGroupInfos(t *testing.T) {
-	is := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
 
 	group := newGroup("a", 10, MinGroup)
 	if is.registerGroup(group) != nil {
@@ -265,7 +280,8 @@ func TestAddGroupInfos(t *testing.T) {
 // Verify infostore combination with overlapping group and non-group
 // infos.
 func TestCombine(t *testing.T) {
-	is1 := newInfoStore(emptyAddr)
+	defer leaktest.AfterTest(t)
+	is1 := newInfoStore(1, emptyAddr)
 
 	group1 := newGroup("a", 10, MinGroup)
 	group1Overlap := newGroup("b", 10, MinGroup)
@@ -284,7 +300,7 @@ func TestCombine(t *testing.T) {
 		t.Error("unable to add info1Overlap:", err)
 	}
 
-	is2 := newInfoStore(testAddr("peer"))
+	is2 := newInfoStore(2, testAddr("peer"))
 
 	group2 := newGroup("c", 10, MinGroup)
 	group2Overlap := newGroup("b", 10, MinGroup)
@@ -311,7 +327,7 @@ func TestCombine(t *testing.T) {
 	if len(infosA) != 2 || infosA[0].Key != "a.a" || infosA[1].Key != "a.b" {
 		t.Error("group a missing", infosA[0], infosA[1])
 	}
-	if infosA[0].peerAddr.String() != "<test-addr>" || infosA[1].peerAddr.String() != "<test-addr>" {
+	if infosA[0].peerID != 1 || infosA[1].peerID != 1 {
 		t.Error("infoA peer nodes not set properly", infosA[0], infosA[1])
 	}
 
@@ -319,7 +335,7 @@ func TestCombine(t *testing.T) {
 	if len(infosB) != 1 || infosB[0].Key != "b.a" || infosB[0].Val != info2Overlap.Val {
 		t.Error("group b missing", infosB)
 	}
-	if infosB[0].peerAddr.String() != "peer" {
+	if infosB[0].peerID != 2 {
 		t.Error("infoB peer node not set properly", infosB[0])
 	}
 
@@ -327,7 +343,7 @@ func TestCombine(t *testing.T) {
 	if len(infosC) != 2 || infosC[0].Key != "c.a" || infosC[1].Key != "c.b" {
 		t.Error("group c missing", infosC)
 	}
-	if infosC[0].peerAddr.String() != "peer" || infosC[1].peerAddr.String() != "peer" {
+	if infosC[0].peerID != 2 || infosC[1].peerID != 2 {
 		t.Error("infoC peer nodes not set properly", infosC[0], infosC[1])
 	}
 
@@ -347,7 +363,7 @@ func TestCombine(t *testing.T) {
 // Helper method creates an infostore with two groups with 10
 // infos each and 10 non-group infos.
 func createTestInfoStore(t *testing.T) *infoStore {
-	is := newInfoStore(emptyAddr)
+	is := newInfoStore(1, emptyAddr)
 
 	groupA := newGroup("a", 10, MinGroup)
 	groupB := newGroup("b", 10, MinGroup)
@@ -358,13 +374,19 @@ func createTestInfoStore(t *testing.T) *infoStore {
 	// Insert 10 keys each for groupA, groupB and non-group successively.
 	for i := 0; i < 10; i++ {
 		infoA := is.newInfo(fmt.Sprintf("a.%d", i), float64(i), time.Second)
-		is.addInfo(infoA)
+		if err := is.addInfo(infoA); err != nil {
+			t.Fatal(err)
+		}
 
 		infoB := is.newInfo(fmt.Sprintf("b.%d", i), float64(i+1), time.Second)
-		is.addInfo(infoB)
+		if err := is.addInfo(infoB); err != nil {
+			t.Fatal(err)
+		}
 
 		infoC := is.newInfo(fmt.Sprintf("c.%d", i), float64(i+2), time.Second)
-		is.addInfo(infoC)
+		if err := is.addInfo(infoC); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	return is
@@ -373,11 +395,12 @@ func createTestInfoStore(t *testing.T) *infoStore {
 // Check infostore delta (both group and non-group infos) based on
 // info sequence numbers.
 func TestInfoStoreDelta(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	is := createTestInfoStore(t)
 
 	// Verify deltas with successive sequence numbers.
 	for i := 0; i < 10; i++ {
-		delta := is.delta(testAddr("<client-addr>"), int64(i*3))
+		delta := is.delta(2, int64(i*3))
 		infosA := delta.getGroupInfos("a")
 		infosB := delta.getGroupInfos("b")
 		if len(infosA) != 10-i || len(infosB) != 10-i {
@@ -404,7 +427,7 @@ func TestInfoStoreDelta(t *testing.T) {
 		}
 	}
 
-	if delta := is.delta(emptyAddr, int64(30)); delta != nil {
+	if delta := is.delta(2, int64(30)); delta != nil {
 		t.Error("fetching delta of infostore at maximum sequence number should return nil")
 	}
 }
@@ -412,70 +435,223 @@ func TestInfoStoreDelta(t *testing.T) {
 // TestInfoStoreDistant verifies selection of infos from store with
 // Hops > maxHops.
 func TestInfoStoreDistant(t *testing.T) {
-	addrs := []testAddr{
-		"<addr1>",
-		"<addr2>",
-		"<addr3>",
+	defer leaktest.AfterTest(t)
+	nodes := []proto.NodeID{
+		proto.NodeID(1),
+		proto.NodeID(2),
+		proto.NodeID(3),
 	}
-	is := newInfoStore(emptyAddr)
+	is := newInfoStore(1, emptyAddr)
 	// Add info from each address, with hop count equal to index+1.
-	for i := 0; i < len(addrs); i++ {
+	for i := 0; i < len(nodes); i++ {
 		inf := is.newInfo(fmt.Sprintf("b.%d", i), float64(i), time.Second)
 		inf.Hops = uint32(i + 1)
-		inf.NodeAddr = addrs[i]
-		is.addInfo(inf)
+		inf.NodeID = nodes[i]
+		if err := is.addInfo(inf); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	for i := 0; i < len(addrs); i++ {
-		addrs := is.distant(uint32(i))
-		if addrs.len() != 3-i {
-			t.Errorf("%d addresses (not %d) should be over maxHops = %d", 3-i, addrs.len(), i)
+	for i := 0; i < len(nodes); i++ {
+		nodesLen := is.distant(uint32(i)).len()
+		if nodesLen != 3-i {
+			t.Errorf("%d nodes (not %d) should be over maxHops = %d", 3-i, nodesLen, i)
 		}
 	}
 }
 
-// TestLeastUseful verifies that the least-contributing peer address
+// TestLeastUseful verifies that the least-contributing peer node
 // can be determined.
 func TestLeastUseful(t *testing.T) {
-	addrs := []testAddr{
-		"<addr1>",
-		"<addr2>",
+	defer leaktest.AfterTest(t)
+	nodes := []proto.NodeID{
+		proto.NodeID(1),
+		proto.NodeID(2),
 	}
-	is := newInfoStore(emptyAddr)
+	is := newInfoStore(1, emptyAddr)
 
-	set := newAddrSet(3)
-	if is.leastUseful(set) != nil {
-		t.Error("not expecting an address from an empty set")
+	set := newNodeSet(3)
+	if is.leastUseful(set) != 0 {
+		t.Error("not expecting a node from an empty set")
 	}
 
 	inf1 := is.newInfo("a1", float64(1), time.Second)
-	inf1.peerAddr = addrs[0]
-	is.addInfo(inf1)
-	if is.leastUseful(set) != nil {
-		t.Error("not expecting an address from an empty set")
+	inf1.peerID = 1
+	if err := is.addInfo(inf1); err != nil {
+		t.Fatal(err)
+	}
+	if is.leastUseful(set) != 0 {
+		t.Error("not expecting a node from an empty set")
 	}
 
-	set.addAddr(addrs[0])
-	if is.leastUseful(set) != addrs[0] {
-		t.Error("expecting addrs[0] as least useful")
+	set.addNode(nodes[0])
+	if is.leastUseful(set) != nodes[0] {
+		t.Error("expecting nodes[0] as least useful")
 	}
 
 	inf2 := is.newInfo("a2", float64(2), time.Second)
-	inf2.peerAddr = addrs[0]
-	is.addInfo(inf2)
-	if is.leastUseful(set) != addrs[0] {
-		t.Error("expecting addrs[0] as least useful")
+	inf2.peerID = 1
+	if err := is.addInfo(inf2); err != nil {
+		t.Fatal(err)
+	}
+	if is.leastUseful(set) != nodes[0] {
+		t.Error("expecting nodes[0] as least useful")
 	}
 
-	set.addAddr(addrs[1])
-	if is.leastUseful(set) != addrs[1] {
-		t.Error("expecting addrs[1] as least useful")
+	set.addNode(nodes[1])
+	if is.leastUseful(set) != nodes[1] {
+		t.Error("expecting nodes[1] as least useful")
 	}
 
 	inf3 := is.newInfo("a3", float64(3), time.Second)
-	inf3.peerAddr = addrs[1]
-	is.addInfo(inf3)
-	if is.leastUseful(set) != addrs[1] {
-		t.Error("expecting addrs[1] as least useful")
+	inf3.peerID = 2
+	if err := is.addInfo(inf3); err != nil {
+		t.Fatal(err)
+	}
+	if is.leastUseful(set) != nodes[1] {
+		t.Error("expecting nodes[1] as least useful")
+	}
+}
+
+type callbackRecord struct {
+	keys []string
+	wg   *sync.WaitGroup
+	sync.Mutex
+}
+
+func (cr *callbackRecord) Add(key string, contentsChanged bool) {
+	cr.Lock()
+	defer cr.Unlock()
+	cr.keys = append(cr.keys, fmt.Sprintf("%s-%t", key, contentsChanged))
+	cr.wg.Done()
+}
+
+func (cr *callbackRecord) Keys() []string {
+	cr.Lock()
+	defer cr.Unlock()
+	return append([]string(nil), cr.keys...)
+}
+
+func TestCallbacks(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
+	wg := &sync.WaitGroup{}
+	cb1 := callbackRecord{wg: wg}
+	cb2 := callbackRecord{wg: wg}
+	cbAll := callbackRecord{wg: wg}
+
+	is.registerCallback("key1", cb1.Add)
+	is.registerCallback("key2", cb2.Add)
+	is.registerCallback("key.*", cbAll.Add)
+
+	i1 := is.newInfo("key1", float64(1), time.Second)
+	i2 := is.newInfo("key2", float64(1), time.Second)
+	i3 := is.newInfo("key3", float64(1), time.Second)
+
+	// Add infos twice and verify callbacks aren't called for same timestamps.
+	wg.Add(5)
+	for i := 0; i < 2; i++ {
+		if err := is.addInfo(i1); err != nil {
+			if i == 0 {
+				t.Error(err)
+			}
+		} else {
+			if i != 0 {
+				t.Errorf("expected error on run #%d, but didn't get one", i)
+			}
+		}
+		if err := is.addInfo(i2); err != nil {
+			if i == 0 {
+				t.Error(err)
+			}
+		} else {
+			if i != 0 {
+				t.Errorf("expected error on run #%d, but didn't get one", i)
+			}
+		}
+		if err := is.addInfo(i3); err != nil {
+			if i == 0 {
+				t.Error(err)
+			}
+		} else {
+			if i != 0 {
+				t.Errorf("expected error on run #%d, but didn't get one", i)
+			}
+		}
+		wg.Wait()
+
+		if expKeys := []string{"key1-true"}; !reflect.DeepEqual(cb1.Keys(), expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, cb1.Keys())
+		}
+		if expKeys := []string{"key2-true"}; !reflect.DeepEqual(cb2.Keys(), expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, cb2.Keys())
+		}
+		keys := cbAll.Keys()
+		sort.Strings(keys)
+		if expKeys := []string{"key1-true", "key2-true", "key3-true"}; !reflect.DeepEqual(keys, expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, keys)
+		}
+	}
+
+	// Update an info.
+	i1 = is.newInfo("key1", float64(2), time.Second)
+	wg.Add(2)
+	if err := is.addInfo(i1); err != nil {
+		t.Error(err)
+	}
+	wg.Wait()
+
+	if expKeys := []string{"key1-true", "key1-true"}; !reflect.DeepEqual(cb1.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cb1.Keys())
+	}
+	if expKeys := []string{"key2-true"}; !reflect.DeepEqual(cb2.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cb2.Keys())
+	}
+	keys := cbAll.Keys()
+	sort.Strings(keys)
+	if expKeys := []string{"key1-true", "key1-true", "key2-true", "key3-true"}; !reflect.DeepEqual(keys, expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, keys)
+	}
+
+	// Register another callback with same pattern and verify it is
+	// invoked for all three keys.
+	wg.Add(3)
+	is.registerCallback("key.*", cbAll.Add)
+	wg.Wait()
+
+	expKeys := []string{"key1-true", "key2-true", "key3-true", "key1-true", "key1-true", "key2-true", "key3-true"}
+	sort.Strings(expKeys)
+	keys = cbAll.Keys()
+	sort.Strings(keys)
+	if !reflect.DeepEqual(keys, expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, keys)
+	}
+}
+
+// TestRegisterCallback verifies that a callback is invoked when
+// registered if there are items which match its regexp in the
+// infostore.
+func TestRegisterCallback(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	is := newInfoStore(1, emptyAddr)
+	wg := &sync.WaitGroup{}
+	cb := callbackRecord{wg: wg}
+
+	i1 := is.newInfo("key1", float64(1), time.Second)
+	i2 := is.newInfo("key2", float64(1), time.Second)
+	if err := is.addInfo(i1); err != nil {
+		t.Fatal(err)
+	}
+	if err := is.addInfo(i2); err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Add(2)
+	is.registerCallback("key.*", cb.Add)
+	wg.Wait()
+	actKeys := cb.Keys()
+	sort.Strings(actKeys)
+	if expKeys := []string{"key1-true", "key2-true"}; !reflect.DeepEqual(actKeys, expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cb.Keys())
 	}
 }

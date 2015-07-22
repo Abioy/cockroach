@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -77,33 +77,17 @@ func TestTrueWithin(t *testing.T) {
 	}
 }
 
-type Dummy struct {
-	Key int
-}
+func TestSucceedsWithin(t *testing.T) {
+	// Try a method which always succeeds.
+	SucceedsWithin(t, 1*time.Millisecond, func() error { return nil })
 
-func TestContainsSameElements(t *testing.T) {
-	s1 := []int{1, 1, 3, 2, 1}
-	s2 := []int{3, 2, 1, 1, 1}
-	s3 := []int{1, 1, 3, 2, -100}
-	s4 := []int{4}
-	d1 := []Dummy{Dummy{1}, Dummy{2}}
-	d2 := []Dummy{Dummy{2}, Dummy{1}}
-
-	if !ContainsSameElements([]int{}, []int{}) ||
-		!ContainsSameElements(s1, s2) ||
-		!ContainsSameElements(s1, s1) ||
-		!ContainsSameElements(s2, s2) ||
-		!ContainsSameElements(s2, s1) ||
-		!ContainsSameElements(d1, d2) ||
-		!ContainsSameElements(d2, d2) ||
-		!ContainsSameElements(d1, d1) ||
-		!ContainsSameElements(d2, d1) {
-		t.Error("unexpected failed comparison")
-	}
-
-	if ContainsSameElements(s1, s3) ||
-		ContainsSameElements(s1, s3) ||
-		ContainsSameElements(s1, s4) {
-		t.Error("unexpected succeeded comparison")
-	}
+	// Try a method which suceeds on 5th invocation.
+	count := 0
+	SucceedsWithin(t, 10*time.Millisecond, func() error {
+		count++
+		if count >= 5 {
+			return nil
+		}
+		return Errorf("not yet")
+	})
 }

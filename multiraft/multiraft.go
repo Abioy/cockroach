@@ -1,4 +1,4 @@
-// Copyright 2014 The Cockroach Authors.
+// Copyright 2015 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -18,100 +18,149 @@
 package multiraft
 
 import (
-	"container/list"
-	"math"
-	"math/rand"
-	"net/rpc"
-	"sort"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/coreos/etcd/raft"
+	"github.com/coreos/etcd/raft/raftpb"
+	"golang.org/x/net/context"
 )
 
-// NodeID is a unique non-zero identifier for the node within the cluster.
-type NodeID int32
+const (
+	noGroup = proto.RaftID(0)
 
-// GroupID is a unique identifier for a consensus group within the cluster.
-type GroupID int64
+	reqBufferSize = 100
+)
 
-// isSet returns true if the NodeID is valid (i.e. non-zero)
-func (n NodeID) isSet() bool {
-	return int32(n) != 0
-}
+// An ErrGroupDeleted is returned for commands which are pending while their
+// group is deleted.
+var ErrGroupDeleted = errors.New("raft group deleted")
+
+// ErrStopped is returned for commands that could not be completed before the
+// node was stopped.
+var ErrStopped = errors.New("raft processing stopped")
 
 // Config contains the parameters necessary to construct a MultiRaft object.
 type Config struct {
 	Storage   Storage
 	Transport Transport
-	// Clock may be nil to use real time.
-	Clock Clock
+	// Ticker may be nil to use real time and TickInterval.
+	Ticker Ticker
+	// StateMachine may be nil if the state machine is transient and always starts from
+	// a blank slate.
+	StateMachine StateMachine
 
-	// A new election is called if the ElectionTimeout elapses with no contact from the leader.
-	// The actual ElectionTimeout is chosen randomly from the range [ElectionTimeoutMin,
-	// ElectionTimeoutMax) to minimize the chances of several servers trying to become leaders
-	// simultaneously.  The Raft paper suggests a range of 150-300ms for local networks;
-	// geographically distributed installations should use higher values to account for the
-	// increased round trip time.
-	ElectionTimeoutMin time.Duration
-	ElectionTimeoutMax time.Duration
+	// A new election is called if the election timeout elapses with no
+	// contact from the leader.  The actual timeout is chosen randomly
+	// from the range [ElectionTimeoutTicks*TickInterval,
+	// ElectionTimeoutTicks*TickInterval*2) to minimize the chances of
+	// several servers trying to become leaders simultaneously. The Raft
+	// paper suggests a range of 150-300ms for local networks;
+	// geographically distributed installations should use higher values
+	// to account for the increased round trip time.
+	ElectionTimeoutTicks   int
+	HeartbeatIntervalTicks int
+	TickInterval           time.Duration
 
-	// If Strict is true, some warnings become fatal panics and additional (possibly expensive)
-	// sanity checks will be done.
-	Strict bool
+	// EventBufferSize is the capacity (in number of events) of the
+	// MultiRaft.Events channel. In tests, we use 0 to ensure that there
+	// are no deadlocks when the limit is reached; real deployments may
+	// want to set a buffer so that applying a command committed on one
+	// group does not interfere with other groups or cause heartbeats to
+	// be missed.
+	EventBufferSize int
+
+	EntryFormatter raft.EntryFormatter
 }
 
-// Validate returns an error if any required elements of the Config are missing or invalid.
+// validate returns an error if any required elements of the Config are missing or invalid.
 // Called automatically by NewMultiRaft.
-func (c *Config) Validate() error {
+func (c *Config) validate() error {
 	if c.Transport == nil {
 		return util.Error("Transport is required")
 	}
-	if c.ElectionTimeoutMin == 0 || c.ElectionTimeoutMax == 0 {
-		return util.Error("ElectionTimeout{Min,Max} must be non-zero")
+	if c.ElectionTimeoutTicks == 0 {
+		return util.Error("ElectionTimeoutTicks must be non-zero")
 	}
-	if c.ElectionTimeoutMin > c.ElectionTimeoutMax {
-		return util.Error("ElectionTimeoutMin must be <= ElectionTimeoutMax")
+	if c.HeartbeatIntervalTicks == 0 {
+		return util.Error("HeartbeatIntervalTicks must be non-zero")
+	}
+	if c.TickInterval == 0 {
+		return util.Error("TickInterval must be non-zero")
 	}
 	return nil
 }
 
-// MultiRaft represents a local node in a raft cluster.  The owner is responsible for consuming
+// MultiRaft represents a local node in a raft cluster. The owner is responsible for consuming
 // the Events channel in a timely manner.
 type MultiRaft struct {
 	Config
-	Events   chan interface{}
-	nodeID   NodeID
-	ops      chan interface{}
-	requests chan *rpc.Call
-	stopped  chan struct{}
+	stopper         *stop.Stopper
+	multiNode       raft.MultiNode
+	Events          chan interface{}
+	nodeID          proto.RaftNodeID
+	reqChan         chan *RaftMessageRequest
+	createGroupChan chan *createGroupOp
+	removeGroupChan chan *removeGroupOp
+	proposalChan    chan *proposal
+	// callbackChan is a generic hook to run a callback in the raft thread.
+	callbackChan chan func()
 }
 
+// multiraftServer is a type alias to separate RPC methods
+// (which net/rpc finds via reflection) from others.
+type multiraftServer MultiRaft
+
 // NewMultiRaft creates a MultiRaft object.
-func NewMultiRaft(nodeID NodeID, config *Config) (*MultiRaft, error) {
-	if !nodeID.isSet() {
-		return nil, util.Error("Invalid NodeID")
+func NewMultiRaft(nodeID proto.RaftNodeID, config *Config, stopper *stop.Stopper) (*MultiRaft, error) {
+	if nodeID == 0 {
+		return nil, util.Error("Invalid RaftNodeID")
 	}
-	err := config.Validate()
-	if err != nil {
+	if err := config.validate(); err != nil {
 		return nil, err
 	}
 
-	if config.Clock == nil {
-		config.Clock = RealClock
+	if config.Ticker == nil {
+		config.Ticker = newTicker(config.TickInterval)
+		stopper.AddCloser(config.Ticker)
+	}
+
+	if config.EntryFormatter != nil {
+		// Wrap the EntryFormatter to strip off the command id.
+		ef := config.EntryFormatter
+		config.EntryFormatter = func(data []byte) string {
+			if len(data) == 0 {
+				return "[empty]"
+			}
+			id, cmd := decodeCommand(data)
+			formatted := ef(cmd)
+			return fmt.Sprintf("%x: %s", id, formatted)
+		}
 	}
 
 	m := &MultiRaft{
-		Config:   *config,
-		nodeID:   nodeID,
-		Events:   make(chan interface{}, 1000),
-		ops:      make(chan interface{}, 100),
-		requests: make(chan *rpc.Call, 100),
-		stopped:  make(chan struct{}),
+		Config:    *config,
+		stopper:   stopper,
+		multiNode: raft.StartMultiNode(uint64(nodeID)),
+		nodeID:    nodeID,
+
+		// Output channel.
+		Events: make(chan interface{}, config.EventBufferSize),
+
+		// Input channels.
+		reqChan:         make(chan *RaftMessageRequest, reqBufferSize),
+		createGroupChan: make(chan *createGroupOp),
+		removeGroupChan: make(chan *removeGroupOp),
+		proposalChan:    make(chan *proposal),
+		callbackChan:    make(chan func()),
 	}
 
-	err = m.Transport.Listen(nodeID, m)
-	if err != nil {
+	if err := m.Transport.Listen(nodeID, (*multiraftServer)(m)); err != nil {
 		return nil, err
 	}
 
@@ -119,625 +168,881 @@ func NewMultiRaft(nodeID NodeID, config *Config) (*MultiRaft, error) {
 }
 
 // Start runs the raft algorithm in a background goroutine.
-func (m *MultiRaft) Start() {
+func (m *MultiRaft) Start() error {
 	s := newState(m)
-	go s.start()
+	s.start()
+	return nil
 }
 
-// Stop terminates the running raft instance and shuts down all network interfaces.
-func (m *MultiRaft) Stop() {
-	m.Transport.Stop(m.nodeID)
-	m.ops <- &stopOp{}
-	<-m.stopped
-}
-
-// DoRPC implements ServerInterface
-func (m *MultiRaft) DoRPC(name string, req, resp interface{}) error {
-	call := &rpc.Call{
-		ServiceMethod: name,
-		Args:          req,
-		Reply:         resp,
-		Done:          make(chan *rpc.Call, 1),
-	}
+// RaftMessage implements ServerInterface; this method is called by net/rpc
+// when we receive a message. It returns as soon as the request has been
+// enqueued without waiting for it to be processed.
+func (ms *multiraftServer) RaftMessage(req *RaftMessageRequest,
+	resp *RaftMessageResponse) error {
 	select {
-	case m.requests <- call:
-	default:
-		m.strictErrorLog("RPC request channel blocked")
-		// In non-strict mode, try again with blocking.
-		m.requests <- call
-	}
-	<-call.Done
-	return call.Error
-
-}
-
-// strictErrorLog panics in strict mode and logs an error otherwise.  Arguments are printf-style
-// and will be passed directly to either glog.Errorf or glog.Fatalf.
-func (m *MultiRaft) strictErrorLog(format string, args ...interface{}) {
-	if m.Strict {
-		glog.Fatalf(format, args...)
-	} else {
-		glog.Errorf(format, args...)
+	case ms.reqChan <- req:
+		return nil
+	case <-ms.stopper.ShouldStop():
+		return ErrStopped
 	}
 }
 
 func (m *MultiRaft) sendEvent(event interface{}) {
 	select {
 	case m.Events <- event:
+	case <-m.stopper.ShouldStop():
+	}
+}
+
+// fanoutHeartbeat sends the given heartbeat to all groups which believe that
+// their leader resides on the sending node.
+func (s *state) fanoutHeartbeat(req *RaftMessageRequest) {
+	// A heartbeat message is expanded into a heartbeat for each group
+	// that the remote node is a part of.
+	fromID := proto.RaftNodeID(req.Message.From)
+	originNode, ok := s.nodes[fromID]
+	if !ok {
+		// When a leader considers a follower to be down, it doesn't begin recovery
+		// until the follower has successfully responded to a heartbeat. If we get a
+		// heartbeat from a node we don't know, it must think we are a follower of
+		// some group, so we need to respond so it can activate the recovery process.
+		log.Warningf("node %v: not fanning out heartbeat from unknown node %v (but responding anyway)",
+			s.nodeID, fromID)
+		s.sendMessage(noGroup,
+			raftpb.Message{
+				From: uint64(s.nodeID),
+				To:   req.Message.From,
+				Type: raftpb.MsgHeartbeatResp,
+			})
 		return
-	default:
-		// TODO(bdarnell): how should we handle filling up the Event queue?
-		// Is there any place to apply backpressure?
-		panic("MultiRaft.Events backlog reached limit")
 	}
-}
-
-// CreateGroup creates a new consensus group and joins it.  The application should
-// arrange to call CreateGroup on all nodes named in initialMembers.
-func (m *MultiRaft) CreateGroup(groupID GroupID, initialMembers []NodeID) error {
-	for _, id := range initialMembers {
-		if !id.isSet() {
-			return util.Error("Invalid NodeID")
+	cnt := 0
+	for groupID := range originNode.groupIDs {
+		// If we don't think that the sending node is leading that group, don't
+		// propagate.
+		if s.groups[groupID].leader != fromID || fromID == s.nodeID {
+			if log.V(8) {
+				log.Infof("node %v: not fanning out heartbeat to %v, msg is from %d and leader is %d",
+					s.nodeID, req.Message.To, fromID, s.groups[groupID].leader)
+			}
+			continue
 		}
+		if err := s.multiNode.Step(context.Background(), uint64(groupID), req.Message); err != nil {
+			if log.V(4) {
+				log.Infof("node %v: coalesced heartbeat step to group %v failed for message %s", s.nodeID, groupID,
+					raft.DescribeMessage(req.Message, s.EntryFormatter))
+			}
+		}
+		cnt++
 	}
-	op := &createGroupOp{newGroup(groupID, initialMembers), make(chan error)}
-	m.ops <- op
+	if cnt > 0 {
+		s.sendMessage(noGroup,
+			raftpb.Message{
+				From: uint64(s.nodeID),
+				To:   req.Message.From,
+				Type: raftpb.MsgHeartbeatResp,
+			})
+	}
+	if log.V(7) {
+		log.Infof("node %v: received coalesced heartbeat from node %v; "+
+			"fanned out to %d followers in %d overlapping groups",
+			s.nodeID, fromID, cnt, len(originNode.groupIDs))
+	}
+}
+
+// fanoutHeartbeatResponse sends the given heartbeat response to all groups
+// which overlap with the sender's groups and consider themselves leader.
+func (s *state) fanoutHeartbeatResponse(fromID proto.RaftNodeID) {
+	originNode, ok := s.nodes[fromID]
+	if !ok {
+		log.Warningf("node %v: not fanning out heartbeat response from unknown node %v",
+			s.nodeID, fromID)
+		return
+	}
+	// Term in HeartbeatResponse is no meaning in fanouting. Otherwise it
+	// will cause Leader change to Follower if another group's term is
+	// greater than this.
+	req := raftpb.Message{
+		From: uint64(fromID),
+		To:   uint64(s.nodeID),
+		Type: raftpb.MsgHeartbeatResp,
+	}
+
+	cnt := 0
+	for groupID := range originNode.groupIDs {
+		// If we don't think that the local node is leader, don't propagate.
+		if s.groups[groupID].leader != s.nodeID || fromID == s.nodeID {
+			if log.V(8) {
+				log.Infof("node %v: not fanning out heartbeat response to %v, leader is %v",
+					s.nodeID, fromID, s.groups[groupID].leader)
+			}
+			continue
+		}
+		if err := s.multiNode.Step(context.Background(), uint64(groupID), req); err != nil {
+			if log.V(4) {
+				log.Infof("node %v: coalesced heartbeat response step to group %v failed", s.nodeID, groupID)
+			}
+		}
+		cnt++
+	}
+	if log.V(7) {
+		log.Infof("node %v: received coalesced heartbeat response from node %v; "+
+			"fanned out to %d leaders in %d overlapping groups",
+			s.nodeID, fromID, cnt, len(originNode.groupIDs))
+	}
+}
+
+// CreateGroup creates a new consensus group and joins it. The initial membership of this
+// group is determined by the InitialState method of the group's Storage object.
+func (m *MultiRaft) CreateGroup(groupID proto.RaftID) error {
+	op := &createGroupOp{
+		groupID: groupID,
+		ch:      make(chan error, 1),
+	}
+	m.createGroupChan <- op
 	return <-op.ch
 }
 
-// SubmitCommand sends a command (a binary blob) to the cluster.  This method returns
+// RemoveGroup destroys the consensus group with the given ID.
+// No events for this group will be emitted after this method returns
+// (but some events may still be in the channel buffer).
+func (m *MultiRaft) RemoveGroup(groupID proto.RaftID) error {
+	op := &removeGroupOp{
+		groupID: groupID,
+		ch:      make(chan error, 1),
+	}
+	m.removeGroupChan <- op
+	return <-op.ch
+}
+
+// SubmitCommand sends a command (a binary blob) to the cluster. This method returns
 // when the command has been successfully sent, not when it has been committed.
-// TODO(bdarnell): should SubmitCommand wait until the commit?
-func (m *MultiRaft) SubmitCommand(groupID GroupID, command []byte) error {
-	op := &submitCommandOp{groupID, command, make(chan error)}
-	m.ops <- op
-	return <-op.ch
+// An error or nil will be written to the returned channel when the command has
+// been committed or aborted.
+func (m *MultiRaft) SubmitCommand(groupID proto.RaftID, commandID string, command []byte) <-chan error {
+	if log.V(6) {
+		log.Infof("node %v submitting command to group %v", m.nodeID, groupID)
+	}
+	ch := make(chan error, 1)
+	m.proposalChan <- &proposal{
+		groupID:   groupID,
+		commandID: commandID,
+		fn: func() {
+			if err := m.multiNode.Propose(context.Background(), uint64(groupID),
+				encodeCommand(commandID, command)); err != nil {
+				log.Errorf("node %v: error proposing command to group %v: %s", m.nodeID, groupID, err)
+			}
+		},
+		ch: ch,
+	}
+	return ch
 }
 
-// Role represents the state of the node in a group.
-type Role int
+// ChangeGroupMembership submits a proposed membership change to the cluster.
+// Payload is an opaque blob that will be returned in EventMembershipChangeCommitted.
+func (m *MultiRaft) ChangeGroupMembership(groupID proto.RaftID, commandID string,
+	changeType raftpb.ConfChangeType, nodeID proto.RaftNodeID, payload []byte) <-chan error {
+	if log.V(6) {
+		log.Infof("node %v proposing membership change to group %v", m.nodeID, groupID)
+	}
+	ch := make(chan error, 1)
+	m.proposalChan <- &proposal{
+		groupID:   groupID,
+		commandID: commandID,
+		fn: func() {
+			if err := m.multiNode.ProposeConfChange(context.Background(), uint64(groupID),
+				raftpb.ConfChange{
+					Type:    changeType,
+					NodeID:  uint64(nodeID),
+					Context: encodeCommand(commandID, payload),
+				},
+			); err != nil {
+				log.Errorf("node %v: error proposing membership change to node %v: %s", m.nodeID,
+					groupID, err)
+			}
 
-// Nodes can be either observers, followers, candidates, or leaders.  Observers receive
-// replicated logs but do not vote.  There is at most one Leader per term; a node cannot become
-// a Leader without first becoming a Candiate and winning an election.
-const (
-	RoleObserver Role = iota
-	RoleFollower
-	RoleCandidate
-	RoleLeader
-)
+		},
+		ch: ch,
+	}
+	return ch
+}
 
-// pendingCall represents an RPC that we should not respond to until we have persisted
-// up to the given point.  term and logIndex may be -1 if the rpc didn't modify that
-// variable and therefore can be resolved regardless of its value.
-type pendingCall struct {
-	call     *rpc.Call
-	term     int
-	logIndex int
+// Status returns the current status of the given group.
+func (m *MultiRaft) Status(groupID proto.RaftID) *raft.Status {
+	return m.multiNode.Status(uint64(groupID))
+}
+
+type proposal struct {
+	groupID   proto.RaftID
+	commandID string
+	fn        func()
+	ch        chan<- error
 }
 
 // group represents the state of a consensus group.
 type group struct {
-	groupID GroupID
-	// Persistent state.  When an RPC is received (or another event occurs), the in-memory fields
-	// are updated immediately; the 'persisted' versions are updated later after they have been
-	// (asynchronously) written to stable storage.  The group is 'dirty' whenever the current
-	// and persisted data differ.
-	electionState             *GroupElectionState
-	committedMembers          *GroupMembers
-	lastLogIndex              int
-	lastLogTerm               int
-	persistedElectionState    *GroupElectionState
-	persistedCommittedMembers *GroupMembers
-	persistedLastIndex        int
-	persistedLastTerm         int
+	// committedTerm is the term of the most recently committed entry.
+	committedTerm uint64
 
-	// Volatile state
-	role             Role
-	commitIndex      int
-	lastApplied      int
-	electionDeadline time.Time
-	votes            map[NodeID]bool
+	// leader is the node ID of the last known leader for this group, or
+	// 0 if an election is in progress.
+	leader proto.RaftNodeID
 
-	// Candidate/leader volatile state.  Reset on conversion to candidate.
-	currentMembers *GroupMembers
-
-	// Leader volatile state.  Reset on election.
-	nextIndex  map[NodeID]int // default: lastLogIndex + 1
-	matchIndex map[NodeID]int // default: 0
-
-	// a List of *pendingCall
-	pendingCalls list.List
-
-	// LogEntries that have not been persisted.  The group is 'dirty' when this is non-empty.
-	pendingEntries []*LogEntry
+	// pending contains all commands that have been proposed but not yet
+	// committed in the current term. When a proposal is committed, nil
+	// is written to proposal.ch and it is removed from this
+	// map.
+	pending map[string]*proposal
+	// writing is true while an active writeTask exists for this group.
+	// We need to keep track of this since groups can be removed and
+	// re-added at any time, and we don't want a writeTask started by
+	// an earlier incarnation to be fed into a later one.
+	writing bool
 }
-
-func newGroup(groupID GroupID, members []NodeID) *group {
-	return &group{
-		groupID:       groupID,
-		electionState: &GroupElectionState{},
-		committedMembers: &GroupMembers{
-			Members: members,
-		},
-		role:       RoleFollower,
-		nextIndex:  make(map[NodeID]int),
-		matchIndex: make(map[NodeID]int),
-	}
-}
-
-// findQuorumIndex examines matchIndex to find the largest log index that a quorum has
-// agreed on.  This method is aware of the "joint consensus" state during membership changes
-// and reports the minimum index agreed to by the new and old membership sets (considered
-// separately).
-func (g *group) findQuorumIndex() int {
-	oldQuorum := g.findQuorumIndexInNodes(g.currentMembers.Members)
-	if len(g.currentMembers.ProposedMembers) > 0 {
-		newQuorum := g.findQuorumIndexInNodes(g.currentMembers.ProposedMembers)
-		if newQuorum < oldQuorum {
-			return newQuorum
-		}
-	}
-	return oldQuorum
-}
-
-func (g *group) findQuorumIndexInNodes(nodes []NodeID) int {
-	var indices []int
-	for _, nodeID := range nodes {
-		indices = append(indices, g.matchIndex[nodeID])
-	}
-	sort.Ints(indices)
-	quorumPos := len(indices)/2 + 1
-	return indices[quorumPos]
-}
-
-type stopOp struct{}
 
 type createGroupOp struct {
-	group *group
-	ch    chan error
+	groupID proto.RaftID
+	ch      chan error
 }
 
-type submitCommandOp struct {
-	groupID GroupID
-	command []byte
+type removeGroupOp struct {
+	groupID proto.RaftID
 	ch      chan error
 }
 
 // node represents a connection to a remote node.
 type node struct {
-	nodeID   NodeID
+	nodeID   proto.RaftNodeID
 	refCount int
-	client   *asyncClient
+	groupIDs map[proto.RaftID]struct{}
 }
 
-// state represents the internal state of a MultiRaft object.  All variables here
+func (n *node) registerGroup(groupID proto.RaftID) {
+	if groupID == noGroup {
+		panic("must not call registerGroup with noGroup")
+	}
+	n.groupIDs[groupID] = struct{}{}
+}
+
+func (n *node) unregisterGroup(groupID proto.RaftID) {
+	delete(n.groupIDs, groupID)
+}
+
+// state represents the internal state of a MultiRaft object. All variables here
 // are accessible only from the state.start goroutine so they can be accessed without
 // synchronization.
 type state struct {
 	*MultiRaft
-	rand          *rand.Rand
-	groups        map[GroupID]*group
-	dirtyGroups   map[GroupID]*group
-	nodes         map[NodeID]*node
-	electionTimer *time.Timer
-	responses     chan *rpc.Call
-	writeTask     *writeTask
+	groups    map[proto.RaftID]*group
+	nodes     map[proto.RaftNodeID]*node
+	writeTask *writeTask
 }
 
 func newState(m *MultiRaft) *state {
 	return &state{
-		MultiRaft:   m,
-		rand:        util.NewPseudoRand(),
-		groups:      make(map[GroupID]*group),
-		dirtyGroups: make(map[GroupID]*group),
-		nodes:       make(map[NodeID]*node),
-		responses:   make(chan *rpc.Call, 100),
-		writeTask:   newWriteTask(m.Storage),
+		MultiRaft: m,
+		groups:    make(map[proto.RaftID]*group),
+		nodes:     make(map[proto.RaftNodeID]*node),
+		writeTask: newWriteTask(m.Storage),
 	}
-}
-
-func (s *state) updateElectionDeadline(g *group) {
-	timeout := util.RandIntInRange(s.rand, int(s.ElectionTimeoutMin), int(s.ElectionTimeoutMax))
-	g.electionDeadline = s.Clock.Now().Add(time.Duration(timeout))
-}
-
-func (s *state) nextElectionTimer() *time.Timer {
-	minTimeout := time.Duration(math.MaxInt64)
-	now := s.Clock.Now()
-	for _, g := range s.groups {
-		timeout := g.electionDeadline.Sub(now)
-		if timeout < minTimeout {
-			minTimeout = timeout
-		}
-	}
-	return s.Clock.NewElectionTimer(minTimeout)
 }
 
 func (s *state) start() {
-	glog.V(1).Infof("node %v starting", s.nodeID)
-	go s.writeTask.start()
-	for {
-		electionTimer := s.nextElectionTimer()
-		var writeReady chan struct{}
-		if len(s.dirtyGroups) > 0 {
-			writeReady = s.writeTask.ready
-		} else {
-			writeReady = nil
+	s.stopper.RunWorker(func() {
+		defer s.stop()
+		if log.V(1) {
+			log.Infof("node %v starting", s.nodeID)
 		}
-		glog.V(6).Infof("node %v: selecting", s.nodeID)
-		select {
-		case op := <-s.ops:
-			glog.V(6).Infof("node %v: got op %#v", s.nodeID, op)
-			switch op := op.(type) {
-			case *stopOp:
-				s.stop()
+		s.writeTask.start(s.stopper)
+		// These maps form a kind of state machine: We don't want to read from the
+		// ready channel until the groups we got from the last read have made their
+		// way through the rest of the pipeline.
+		var readyGroups map[uint64]raft.Ready
+		var writingGroups map[uint64]raft.Ready
+		// Counts up to heartbeat interval and is then reset.
+		ticks := 0
+		for {
+			// raftReady signals that the Raft state machine has pending
+			// work. That work is supplied over the raftReady channel as a map
+			// from group ID to raft.Ready struct.
+			var raftReady <-chan map[uint64]raft.Ready
+			// writeReady is set to the write task's ready channel, which
+			// receives when the write task is prepared to persist ready data
+			// from the Raft state machine.
+			// The writeReady mechanism is currently disabled as we are testing
+			// performing all writes synchronously.
+			// TODO(bdarnell): either reinstate writeReady or rip it out completely.
+			//var writeReady chan struct{}
+
+			// The order of operations in this loop structure is as follows:
+			// start by setting raftReady to the multiNode's Ready()
+			// channel. Once a new raftReady has been consumed from the
+			// channel, set writeReady to the write task's ready channel and
+			// set raftReady back to nil. This advances our read-from-raft /
+			// write-to-storage state machine to the next step: wait for the
+			// write task to be ready to persist the new data.
+			if readyGroups != nil {
+				//writeReady = s.writeTask.ready
+			} else if writingGroups == nil {
+				raftReady = s.multiNode.Ready()
+			}
+
+			if log.V(8) {
+				log.Infof("node %v: selecting", s.nodeID)
+			}
+			select {
+			case <-s.stopper.ShouldStop():
 				return
 
-			case *createGroupOp:
-				s.createGroup(op)
+			case req := <-s.reqChan:
+				if log.V(5) {
+					log.Infof("node %v: group %v got message %.200s", s.nodeID, req.GroupID,
+						raft.DescribeMessage(req.Message, s.EntryFormatter))
+				}
+				switch req.Message.Type {
+				case raftpb.MsgHeartbeat:
+					s.fanoutHeartbeat(req)
+				case raftpb.MsgHeartbeatResp:
+					s.fanoutHeartbeatResponse(proto.RaftNodeID(req.Message.From))
+				default:
+					// We only want to lazily create the group if it's not heartbeat-related;
+					// our heartbeats are coalesced and contain a dummy GroupID.
+					// TODO(tschottdorf) still shouldn't hurt to move this part outside,
+					// but suddenly tests will start failing. Should investigate.
+					if _, ok := s.groups[req.GroupID]; !ok {
+						log.Infof("node %v: got message for unknown group %d; creating it", s.nodeID, req.GroupID)
+						if err := s.createGroup(req.GroupID); err != nil {
+							log.Warningf("Error creating group %d: %s", req.GroupID, err)
+							break
+						}
+					}
 
-			case *submitCommandOp:
-				s.submitCommand(op)
+					if err := s.multiNode.Step(context.Background(), uint64(req.GroupID), req.Message); err != nil {
+						if log.V(4) {
+							log.Infof("node %v: multinode step to group %v failed for message %.200s", s.nodeID, req.GroupID,
+								raft.DescribeMessage(req.Message, s.EntryFormatter))
+						}
+					}
+				}
+			case op := <-s.createGroupChan:
+				if log.V(6) {
+					log.Infof("node %v: got op %#v", s.nodeID, op)
+				}
+				op.ch <- s.createGroup(op.groupID)
 
-			default:
-				s.strictErrorLog("unknown op: %#v", op)
+			case op := <-s.removeGroupChan:
+				if log.V(6) {
+					log.Infof("node %v: got op %#v", s.nodeID, op)
+				}
+				s.removeGroup(op, readyGroups)
+
+			case prop := <-s.proposalChan:
+				s.propose(prop)
+
+			case readyGroups = <-raftReady:
+				// readyGroups are saved in a local variable until they can be sent to
+				// the write task (and then the real work happens after the write is
+				// complete). All we do for now is log them.
+				s.logRaftReady(readyGroups)
+
+				select {
+				case s.writeTask.ready <- struct{}{}:
+				case <-s.stopper.ShouldStop():
+					return
+				}
+				s.handleWriteReady(readyGroups)
+				writingGroups = readyGroups
+				readyGroups = nil
+
+				select {
+				case resp := <-s.writeTask.out:
+					s.handleWriteResponse(resp, writingGroups)
+					s.multiNode.Advance(writingGroups)
+					writingGroups = nil
+				case <-s.stopper.ShouldStop():
+					return
+				}
+
+			case <-s.Ticker.Chan():
+				if log.V(8) {
+					log.Infof("node %v: got tick", s.nodeID)
+				}
+				s.multiNode.Tick()
+				ticks++
+				if ticks >= s.HeartbeatIntervalTicks {
+					ticks = 0
+					s.coalescedHeartbeat()
+				}
+
+			case cb := <-s.callbackChan:
+				cb()
 			}
-
-		case call := <-s.requests:
-			glog.V(6).Infof("node %v: got request %v", s.nodeID, call)
-			switch call.ServiceMethod {
-			case requestVoteName:
-				s.requestVoteRequest(call.Args.(*RequestVoteRequest),
-					call.Reply.(*RequestVoteResponse), call)
-
-			case appendEntriesName:
-				s.appendEntriesRequest(call.Args.(*AppendEntriesRequest),
-					call.Reply.(*AppendEntriesResponse), call)
-
-			default:
-				s.strictErrorLog("unknown rpc request: %#v", call.Args)
-			}
-
-		case call := <-s.responses:
-			glog.V(6).Infof("node %v: got response %v", s.nodeID, call)
-			switch call.ServiceMethod {
-			case requestVoteName:
-				s.requestVoteResponse(call.Args.(*RequestVoteRequest), call.Reply.(*RequestVoteResponse))
-
-			case appendEntriesName:
-				s.appendEntriesResponse(call.Args.(*AppendEntriesRequest),
-					call.Reply.(*AppendEntriesResponse))
-
-			default:
-				s.strictErrorLog("unknown rpc response: %#v", call.Reply)
-			}
-
-		case writeReady <- struct{}{}:
-			s.handleWriteReady()
-
-		case resp := <-s.writeTask.out:
-			s.handleWriteResponse(resp)
-
-		case now := <-electionTimer.C:
-			glog.V(6).Infof("node %v: got election timer", s.nodeID)
-			s.handleElectionTimers(now)
 		}
-		s.Clock.StopElectionTimer(electionTimer)
+	})
+}
+
+func (s *state) removePending(g *group, prop *proposal, err error) {
+	if prop == nil {
+		return
+	}
+	// Because of the way we re-queue proposals during leadership
+	// changes, we may finish the same proposal object twice.
+	if prop.ch != nil {
+		prop.ch <- err
+		prop.ch = nil
+	}
+	if g != nil {
+		delete(g.pending, prop.commandID)
+	}
+}
+
+func (s *state) coalescedHeartbeat() {
+	// TODO(Tobias): We don't need to send heartbeats to nodes that have
+	// no group following one of our local groups. But that's unlikely
+	// to be the case for many of our nodes. It could make sense though
+	// to space out the heartbeats over the heartbeat interval so that
+	// we don't try to send for all nodes at once.
+	for nodeID := range s.nodes {
+		// Don't heartbeat yourself.
+		if nodeID == s.nodeID {
+			continue
+		}
+		if log.V(6) {
+			log.Infof("node %v: triggering coalesced heartbeat to node %v", s.nodeID, nodeID)
+		}
+		s.sendMessage(noGroup,
+			raftpb.Message{
+				From: uint64(s.nodeID),
+				To:   uint64(nodeID),
+				Type: raftpb.MsgHeartbeat,
+			})
 	}
 }
 
 func (s *state) stop() {
-	glog.V(6).Infof("node %v stopping", s.nodeID)
-	for _, n := range s.nodes {
-		err := n.client.conn.Close()
-		if err != nil {
-			glog.Warning("error stopping client:", err)
-		}
+	if log.V(6) {
+		log.Infof("node %v stopping", s.nodeID)
 	}
-	s.writeTask.stop()
-	close(s.stopped)
+	s.MultiRaft.multiNode.Stop()
+	s.MultiRaft.Transport.Stop(s.nodeID)
 }
 
-func (s *state) createGroup(op *createGroupOp) {
-	glog.V(6).Infof("node %v creating group %v", s.nodeID, op.group.groupID)
-	if _, ok := s.groups[op.group.groupID]; ok {
-		op.ch <- util.Errorf("group %v already exists", op.group.groupID)
+// addNode creates a node and registers the given groupIDs for that
+// node. If the node already exists and possible some of the groups
+// are already registered, only the missing groups will be added in.
+func (s *state) addNode(nodeID proto.RaftNodeID, groupIDs ...proto.RaftID) error {
+	for _, groupID := range groupIDs {
+		if groupID == noGroup {
+			panic(fmt.Sprintf("attempt to add dummy group to node %d", nodeID))
+		}
+		if _, ok := s.groups[groupID]; !ok {
+			return util.Errorf("can not add invalid group %d to node %d",
+				groupID, nodeID)
+		}
+	}
+	newNode, ok := s.nodes[nodeID]
+	if !ok {
+		s.nodes[nodeID] = &node{
+			nodeID:   nodeID,
+			refCount: 1,
+			groupIDs: make(map[proto.RaftID]struct{}),
+		}
+		newNode = s.nodes[nodeID]
+	}
+	for _, groupID := range groupIDs {
+		newNode.registerGroup(groupID)
+	}
+	return nil
+}
+
+func (s *state) createGroup(groupID proto.RaftID) error {
+	if _, ok := s.groups[groupID]; ok {
+		return nil
+	}
+	if log.V(3) {
+		log.Infof("node %v creating group %v", s.nodeID, groupID)
+	}
+
+	gs := s.Storage.GroupStorage(groupID)
+	_, cs, err := gs.InitialState()
+	if err != nil {
+		return err
+	}
+
+	var appliedIndex uint64
+	if s.StateMachine != nil {
+		appliedIndex, err = s.StateMachine.AppliedIndex(groupID)
+		if err != nil {
+			return err
+		}
+	}
+
+	raftCfg := &raft.Config{
+		Applied:       appliedIndex,
+		ElectionTick:  s.ElectionTimeoutTicks,
+		HeartbeatTick: s.HeartbeatIntervalTicks,
+		Storage:       gs,
+		// TODO(bdarnell): make these configurable; evaluate defaults.
+		MaxSizePerMsg:   1024 * 1024,
+		MaxInflightMsgs: 256,
+	}
+	if err := s.multiNode.CreateGroup(uint64(groupID), raftCfg, nil); err != nil {
+		return err
+	}
+	s.groups[groupID] = &group{
+		pending: map[string]*proposal{},
+	}
+
+	for _, nodeID := range cs.Nodes {
+		if err := s.addNode(proto.RaftNodeID(nodeID), groupID); err != nil {
+			return err
+		}
+	}
+
+	// Automatically campaign and elect a leader for this group if there's
+	// exactly one known node for this group.
+	//
+	// A grey area for this being correct happens in the case when we're
+	// currently in the progress of adding a second node to the group,
+	// with the change committed but not applied.
+	// Upon restarting, the node would immediately elect itself and only
+	// then apply the config change, where really it should be applying
+	// first and then waiting for the majority (which would now require
+	// two votes, not only its own).
+	// However, in that special case, the second node has no chance to
+	// be elected master while this node restarts (as it's aware of the
+	// configuration and knows it needs two votes), so the worst that
+	// could happen is both nodes ending up in candidate state, timing
+	// out and then voting again. This is expected to be an extremely
+	// rare event.
+	if len(cs.Nodes) == 1 && s.MultiRaft.nodeID == proto.RaftNodeID(cs.Nodes[0]) {
+		return s.multiNode.Campaign(context.Background(), uint64(groupID))
+	}
+	return nil
+}
+
+func (s *state) removeGroup(op *removeGroupOp, readyGroups map[uint64]raft.Ready) {
+	// Group creation is lazy and idempotent; so is removal.
+	g, ok := s.groups[op.groupID]
+	if !ok {
+		op.ch <- nil
 		return
 	}
-	for _, member := range op.group.committedMembers.Members {
-		if node, ok := s.nodes[member]; ok {
-			node.refCount++
+	if log.V(3) {
+		log.Infof("node %v removing group %v", s.nodeID, op.groupID)
+	}
+
+	// Cancel commands which are still in transit.
+	for _, prop := range g.pending {
+		s.removePending(g, prop, ErrGroupDeleted)
+	}
+
+	if err := s.multiNode.RemoveGroup(uint64(op.groupID)); err != nil {
+		op.ch <- err
+		return
+	}
+	gs := s.Storage.GroupStorage(op.groupID)
+	_, cs, err := gs.InitialState()
+	if err != nil {
+		op.ch <- err
+	}
+	for _, nodeID := range cs.Nodes {
+		s.nodes[proto.RaftNodeID(nodeID)].unregisterGroup(op.groupID)
+	}
+	// Delete any entries for this group in readyGroups.
+	if readyGroups != nil {
+		delete(readyGroups, uint64(op.groupID))
+	}
+
+	delete(s.groups, op.groupID)
+	op.ch <- nil
+}
+
+func (s *state) propose(p *proposal) {
+	g, ok := s.groups[p.groupID]
+	if !ok {
+		s.removePending(nil /* group */, p, ErrGroupDeleted)
+		return
+	}
+	if log.V(3) {
+		log.Infof("group %d: new proposal %x", p.groupID, p.commandID)
+	}
+	g.pending[p.commandID] = p
+	p.fn()
+}
+
+func (s *state) logRaftReady(readyGroups map[uint64]raft.Ready) {
+	for groupID, ready := range readyGroups {
+		if log.V(5) {
+			log.Infof("node %v: group %v raft ready", s.nodeID, groupID)
+			if ready.SoftState != nil {
+				log.Infof("SoftState updated: %+v", *ready.SoftState)
+			}
+			if !raft.IsEmptyHardState(ready.HardState) {
+				log.Infof("HardState updated: %+v", ready.HardState)
+			}
+			for i, e := range ready.Entries {
+				log.Infof("New Entry[%d]: %.200s", i, raft.DescribeEntry(e, s.EntryFormatter))
+			}
+			for i, e := range ready.CommittedEntries {
+				log.Infof("Committed Entry[%d]: %.200s", i, raft.DescribeEntry(e, s.EntryFormatter))
+			}
+			if !raft.IsEmptySnap(ready.Snapshot) {
+				log.Infof("Snapshot updated: %.200s", ready.Snapshot.String())
+			}
+			for i, m := range ready.Messages {
+				log.Infof("Outgoing Message[%d]: %.200s", i, raft.DescribeMessage(m, s.EntryFormatter))
+			}
+		}
+	}
+}
+
+// handleWriteReady converts a set of raft.Ready structs into a writeRequest
+// to be persisted, marks the group as writing and sends it to the writeTask.
+func (s *state) handleWriteReady(readyGroups map[uint64]raft.Ready) {
+	if log.V(6) {
+		log.Infof("node %v write ready, preparing request", s.nodeID)
+	}
+	writeRequest := newWriteRequest()
+	for groupID, ready := range readyGroups {
+		raftGroupID := proto.RaftID(groupID)
+		g, ok := s.groups[raftGroupID]
+		if !ok {
+			if log.V(6) {
+				log.Infof("dropping write request to group %d", groupID)
+			}
 			continue
 		}
-		conn, err := s.Transport.Connect(member)
-		if err != nil {
-			op.ch <- err
-			return
+		g.writing = true
+
+		gwr := &groupWriteRequest{}
+		if !raft.IsEmptyHardState(ready.HardState) {
+			gwr.state = ready.HardState
 		}
-		s.nodes[member] = &node{member, 1, &asyncClient{member, conn, s.responses}}
-	}
-	s.updateElectionDeadline(op.group)
-	s.groups[op.group.groupID] = op.group
-	op.ch <- nil
-}
-
-func (s *state) submitCommand(op *submitCommandOp) {
-	glog.V(6).Infof("node %v submitting command to group %v", s.nodeID, op.groupID)
-	g := s.groups[op.groupID]
-	if g.role != RoleLeader {
-		op.ch <- util.Error("TODO(bdarnell): forward commands to leader")
-		return
-	}
-
-	g.lastLogIndex++
-	entry := &LogEntry{
-		Term:    g.electionState.CurrentTerm,
-		Index:   g.lastLogIndex,
-		Type:    LogEntryCommand,
-		Payload: op.command,
-	}
-	g.pendingEntries = append(g.pendingEntries, entry)
-	s.updateDirtyStatus(g)
-	op.ch <- nil
-}
-
-func (s *state) requestVoteRequest(req *RequestVoteRequest, resp *RequestVoteResponse,
-	call *rpc.Call) {
-	g, ok := s.groups[req.GroupID]
-	if !ok {
-		call.Error = util.Errorf("unknown group %v", req.GroupID)
-		call.Done <- call
-		return
-	}
-	if g.electionState.VotedFor.isSet() && g.electionState.VotedFor != req.CandidateID {
-		resp.VoteGranted = false
-	} else {
-		// TODO: check log positions
-		g.electionState.CurrentTerm = req.Term
-		resp.VoteGranted = true
-	}
-	resp.Term = g.electionState.CurrentTerm
-	g.pendingCalls.PushBack(&pendingCall{call, g.electionState.CurrentTerm, -1})
-	s.updateDirtyStatus(g)
-}
-
-func hasMajority(votes map[NodeID]bool, members []NodeID) bool {
-	voteCount := 0
-	for _, node := range members {
-		if votes[node] {
-			voteCount++
+		if !raft.IsEmptySnap(ready.Snapshot) {
+			gwr.snapshot = ready.Snapshot
 		}
-	}
-	return voteCount*2 > len(members)
-}
-
-func (s *state) requestVoteResponse(req *RequestVoteRequest, resp *RequestVoteResponse) {
-	g := s.groups[req.GroupID]
-	if resp.Term < g.electionState.CurrentTerm {
-		return
-	}
-	if resp.VoteGranted {
-		g.votes[req.DestNode] = resp.VoteGranted
-	}
-	// We can convert from Candidate to Leader if we have enough votes.  If we are in a
-	// transitional "joint consensus" state, we need a quorum of votes from both the old
-	// and new memberships.
-	if g.role == RoleCandidate &&
-		hasMajority(g.votes, g.currentMembers.Members) &&
-		(len(g.currentMembers.ProposedMembers) == 0 ||
-			hasMajority(g.votes, g.currentMembers.ProposedMembers)) {
-		g.role = RoleLeader
-		glog.V(1).Infof("node %v becoming leader for group %v", s.nodeID, g.groupID)
-		s.sendEvent(&EventLeaderElection{g.groupID, s.nodeID})
-	}
-	s.updateDirtyStatus(g)
-}
-
-// From the Raft paper:
-// Receiver implementation:
-// 1. Reply false if term < currentTerm (§5.1)
-// 2. Reply false if log doesn’t contain an entry at prevLogIndex
-// whose term matches prevLogTerm (§5.3)
-// 3. If an existing entry conflicts with a new one (same index but different
-// terms), delete the existing entry and all that follow it (§5.3)
-// 4. Append any new entries not already in the log
-// 5. If leaderCommit > commitIndex, set commitIndex =
-// min(leaderCommit, last log index)
-func (s *state) appendEntriesRequest(req *AppendEntriesRequest, resp *AppendEntriesResponse,
-	call *rpc.Call) {
-	g := s.groups[req.GroupID]
-	resp.Term = g.electionState.CurrentTerm
-	if req.Term < g.electionState.CurrentTerm {
-		resp.Success = false
-		call.Done <- call
-		return
-	}
-	// TODO(bdarnell): check prevLogIndex and terms
-	g.pendingEntries = append(g.pendingEntries, req.Entries...)
-	if len(g.pendingEntries) > 0 {
-		lastEntry := g.pendingEntries[len(g.pendingEntries)-1]
-		g.lastLogIndex = lastEntry.Index
-		g.lastLogTerm = lastEntry.Term
-	}
-	s.updateDirtyStatus(g)
-	resp.Success = true
-	g.pendingCalls.PushBack(&pendingCall{call, -1, g.lastLogIndex})
-	s.commitEntries(g, req.LeaderCommit)
-}
-
-// From the Raft paper:
-// If successful: update nextIndex and matchIndex for follower (§5.3)
-// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
-// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and
-// log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
-func (s *state) appendEntriesResponse(req *AppendEntriesRequest, resp *AppendEntriesResponse) {
-	g := s.groups[req.GroupID]
-	if resp.Success {
-		if len(req.Entries) > 0 {
-			lastIndex := req.Entries[len(req.Entries)-1].Index
-			g.nextIndex[req.DestNode] = lastIndex + 1
-			g.matchIndex[req.DestNode] = lastIndex
+		if len(ready.Entries) > 0 {
+			gwr.entries = ready.Entries
 		}
-	} else {
-		g.nextIndex[req.DestNode]--
-	}
-
-	s.commitEntries(g, g.findQuorumIndex())
-}
-
-func (s *state) handleWriteReady() {
-	glog.V(6).Infof("node %v write ready, preparing request", s.nodeID)
-	writeRequest := newWriteRequest()
-	for groupID, group := range s.dirtyGroups {
-		req := &groupWriteRequest{}
-		writeRequest.groups[groupID] = req
-		if !group.electionState.Equal(group.persistedElectionState) {
-			copy := *group.electionState
-			req.electionState = &copy
-		}
-		if len(group.pendingEntries) > 0 {
-			req.entries = group.pendingEntries
-			group.pendingEntries = nil
-		}
+		writeRequest.groups[raftGroupID] = gwr
 	}
 	s.writeTask.in <- writeRequest
 }
 
-func (s *state) broadcastEntries(g *group, entries []*LogEntry) {
-	if g.role != RoleLeader {
-		return
-	}
-	glog.V(6).Infof("node %v: broadcasting entries to followers", s.nodeID)
-	for _, id := range g.currentMembers.Members {
-		node := s.nodes[id]
-		node.client.appendEntries(&AppendEntriesRequest{
-			RequestHeader: RequestHeader{s.nodeID, id},
-			GroupID:       g.groupID,
-			Term:          g.electionState.CurrentTerm,
-			LeaderID:      s.nodeID,
-			PrevLogIndex:  g.persistedLastIndex,
-			PrevLogTerm:   g.persistedLastTerm,
-			LeaderCommit:  g.commitIndex,
-			Entries:       entries,
+// processCommittedEntry tells the application that a command was committed.
+// Returns the commandID, or an empty string if the given entry was not a command.
+func (s *state) processCommittedEntry(groupID proto.RaftID, g *group, entry raftpb.Entry) string {
+	var commandID string
+	switch entry.Type {
+	case raftpb.EntryNormal:
+		// etcd raft occasionally adds a nil entry (e.g. upon election); ignore these.
+		if entry.Data != nil {
+			var command []byte
+			commandID, command = decodeCommand(entry.Data)
+			s.sendEvent(&EventCommandCommitted{
+				GroupID:   groupID,
+				CommandID: commandID,
+				Command:   command,
+				Index:     entry.Index,
+			})
+		}
+
+	case raftpb.EntryConfChange:
+		cc := raftpb.ConfChange{}
+		if err := cc.Unmarshal(entry.Data); err != nil {
+			log.Fatalf("invalid ConfChange data: %s", err)
+		}
+		var payload []byte
+		if len(cc.Context) > 0 {
+			commandID, payload = decodeCommand(cc.Context)
+		}
+		s.sendEvent(&EventMembershipChangeCommitted{
+			GroupID:    groupID,
+			CommandID:  commandID,
+			Index:      entry.Index,
+			NodeID:     proto.RaftNodeID(cc.NodeID),
+			ChangeType: cc.Type,
+			Payload:    payload,
+			Callback: func(err error) {
+				select {
+				case s.callbackChan <- func() {
+					if err == nil {
+						if log.V(3) {
+							log.Infof("node %v applying configuration change %v", s.nodeID, cc)
+						}
+						// TODO(bdarnell): dedupe by keeping a record of recently-applied commandIDs
+						switch cc.Type {
+						case raftpb.ConfChangeAddNode:
+							err = s.addNode(proto.RaftNodeID(cc.NodeID), proto.RaftID(groupID))
+						case raftpb.ConfChangeRemoveNode:
+							// TODO(bdarnell): support removing nodes; fix double-application of initial entries
+						case raftpb.ConfChangeUpdateNode:
+							// Updates don't concern multiraft, they are simply passed through.
+						}
+						if err != nil {
+							log.Errorf("error applying configuration change %v: %s", cc, err)
+						}
+						s.multiNode.ApplyConfChange(uint64(groupID), cc)
+					} else {
+						log.Warningf("aborting configuration change: %s", err)
+						s.multiNode.ApplyConfChange(uint64(groupID),
+							raftpb.ConfChange{})
+					}
+
+					// Re-submit all pending proposals, in case any of them were config changes
+					// that were dropped due to the one-at-a-time rule. This is a little
+					// redundant since most pending proposals won't benefit from this but
+					// config changes should be rare enough (and the size of the pending queue
+					// small enough) that it doesn't really matter.
+					for _, prop := range g.pending {
+						s.propose(prop)
+					}
+				}:
+				case <-s.stopper.ShouldStop():
+				}
+			},
 		})
 	}
+	return commandID
 }
 
-func (s *state) handleWriteResponse(response *writeResponse) {
-	glog.V(6).Infof("node %v got write response: %#v", s.nodeID, *response)
-	for groupID, persistedGroup := range response.groups {
-		g := s.groups[groupID]
-		if persistedGroup.electionState != nil {
-			g.persistedElectionState = persistedGroup.electionState
-		}
-		if persistedGroup.lastIndex != -1 {
-			glog.V(6).Infof("node %v: updating persisted log index to %v", s.nodeID,
-				persistedGroup.lastIndex)
-			s.broadcastEntries(g, persistedGroup.entries)
-			g.persistedLastIndex = persistedGroup.lastIndex
-			g.persistedLastTerm = persistedGroup.lastTerm
-		}
-
-		// Resolve any pending RPCs that have been waiting for persistence to catch up.
-		var toDelete []*list.Element
-		for e := g.pendingCalls.Front(); e != nil; e = e.Next() {
-			call := e.Value.(*pendingCall)
-			if g.persistedElectionState == nil || g.persistedLastIndex == -1 {
-				continue
-			}
-			if call.term != -1 && call.term > g.persistedElectionState.CurrentTerm {
-				continue
-			}
-			if call.logIndex != -1 && call.logIndex > g.persistedLastIndex {
-				continue
-			}
-			call.call.Done <- call.call
-			toDelete = append(toDelete, e)
-		}
-		for _, e := range toDelete {
-			g.pendingCalls.Remove(e)
-		}
-		s.updateDirtyStatus(g)
+// sendMessage sends a raft message on the given group. Coalesced heartbeats
+// address nodes, not groups; they will use the noGroup constant as groupID.
+func (s *state) sendMessage(groupID proto.RaftID, msg raftpb.Message) {
+	if log.V(6) {
+		log.Infof("node %v sending message %.200s to %v", s.nodeID,
+			raft.DescribeMessage(msg, s.EntryFormatter), msg.To)
 	}
-}
-
-func (s *state) handleElectionTimers(now time.Time) {
-	for _, g := range s.groups {
-		if !now.Before(g.electionDeadline) {
-			s.becomeCandidate(g)
+	nodeID := proto.RaftNodeID(msg.To)
+	if _, ok := s.nodes[nodeID]; !ok {
+		if log.V(4) {
+			log.Infof("node %v: connecting to new node %v", s.nodeID, nodeID)
+		}
+		var err error
+		if groupID != noGroup {
+			err = s.addNode(nodeID, groupID)
+		} else {
+			err = s.addNode(nodeID)
+		}
+		if err != nil {
+			log.Errorf("node %v: error adding group %v to node %v: %v",
+				s.nodeID, groupID, nodeID, err)
+		}
+	}
+	err := s.Transport.Send(&RaftMessageRequest{groupID, msg})
+	snapStatus := raft.SnapshotFinish
+	if err != nil {
+		log.Warningf("node %v failed to send message to %v: %s", s.nodeID, nodeID, err)
+		if groupID != noGroup {
+			s.multiNode.ReportUnreachable(msg.To, uint64(groupID))
+		}
+		snapStatus = raft.SnapshotFailure
+	}
+	if msg.Type == raftpb.MsgSnap {
+		// TODO(bdarnell): add an ack for snapshots and don't report status until
+		// ack, error, or timeout.
+		if groupID != noGroup {
+			s.multiNode.ReportSnapshot(msg.To, uint64(groupID), snapStatus)
 		}
 	}
 }
 
-func (s *state) becomeCandidate(g *group) {
-	glog.V(1).Infof("node %v becoming candidate (was %v) for group %s", s.nodeID, g.role, g.groupID)
-	if g.role == RoleLeader {
-		panic("cannot transition from leader to candidate")
+// maybeSendLeaderEvent processes a raft.Ready to send events in response to leadership
+// changes (this includes both sending an event to the app and retrying any pending
+// proposals).
+func (s *state) maybeSendLeaderEvent(groupID proto.RaftID, g *group, ready *raft.Ready) {
+	term := g.committedTerm
+	if ready.SoftState != nil {
+		// Always save the leader whenever we get a SoftState.
+		g.leader = proto.RaftNodeID(ready.SoftState.Lead)
 	}
-	g.role = RoleCandidate
-	g.electionState.CurrentTerm++
-	g.electionState.VotedFor = s.nodeID
-	g.votes = make(map[NodeID]bool)
-	// TODO(bdarnell): scan the uncommitted tail to find currentMembers.
-	g.currentMembers = g.committedMembers
-	s.updateElectionDeadline(g)
-	for _, id := range g.currentMembers.Members {
-		node := s.nodes[id]
-		node.client.requestVote(&RequestVoteRequest{
-			RequestHeader: RequestHeader{s.nodeID, id},
-			GroupID:       g.groupID,
-			Term:          g.electionState.CurrentTerm,
-			CandidateID:   s.nodeID,
-			LastLogIndex:  g.lastLogIndex,
-			LastLogTerm:   g.lastLogTerm,
+	if len(ready.CommittedEntries) > 0 {
+		term = ready.CommittedEntries[len(ready.CommittedEntries)-1].Term
+	}
+	if term != g.committedTerm && g.leader != 0 {
+		// Whenever the committed term has advanced and we know our leader,
+		// emit an event.
+		g.committedTerm = term
+		s.sendEvent(&EventLeaderElection{
+			GroupID: groupID,
+			NodeID:  proto.RaftNodeID(g.leader),
+			Term:    g.committedTerm,
 		})
-	}
-	s.updateDirtyStatus(g)
-}
 
-func (s *state) commitEntries(g *group, index int) {
-	if index <= g.commitIndex {
-		// Commit index cannot actually move backwards, but a newly-elected leader might
-		// report stale positions for a short time so just ignore them.
-		glog.V(6).Infof("node %v: ignoring commit index %v because it is behind existing commit %v",
-			s.nodeID, index, g.commitIndex)
-		return
-	}
-	if index > g.persistedLastIndex {
-		// If we are not caught up with the leader, just commit as far as we can.
-		// We'll continue to commit new entries as we receive AppendEntriesRequests.
-		glog.V(6).Infof("node %v: leader is commited to %v, but capping to %v",
-			s.nodeID, index, g.persistedLastIndex)
-		index = g.persistedLastIndex
-	}
-	glog.V(6).Infof("node %v advancing commit position for group %v from %v to %v",
-		s.nodeID, g.groupID, g.commitIndex, index)
-	// TODO(bdarnell): move storage access (incl. the channel iteration) to a goroutine
-	entries := make(chan *LogEntryState, 100)
-	go s.Storage.GetLogEntries(g.groupID, g.commitIndex+1, index, entries)
-	for entry := range entries {
-		glog.V(6).Infof("node %v: committing %+v", s.nodeID, entry)
-		if entry.Entry.Type == LogEntryCommand {
-			s.sendEvent(&EventCommandCommitted{entry.Entry.Payload})
+		// Re-submit all pending proposals
+		for _, prop := range g.pending {
+			s.propose(prop)
 		}
 	}
-	g.commitIndex = index
-	s.broadcastEntries(g, nil)
 }
 
-// updateDirtyStatus sets the dirty flag for the given group.
-func (s *state) updateDirtyStatus(g *group) {
-	dirty := false
-	if !g.electionState.Equal(g.persistedElectionState) {
-		dirty = true
+// handleWriteResponse updates the state machine and sends messages for a raft Ready batch.
+func (s *state) handleWriteResponse(response *writeResponse, readyGroups map[uint64]raft.Ready) {
+	if log.V(6) {
+		log.Infof("node %v got write response: %#v", s.nodeID, *response)
 	}
-	if len(g.pendingEntries) > 0 {
-		dirty = true
-	}
-	if dirty {
-		s.dirtyGroups[g.groupID] = g
-	} else {
-		delete(s.dirtyGroups, g.groupID)
+	// Everything has been written to disk; now we can apply updates to the state machine
+	// and send outgoing messages.
+	for groupID, ready := range readyGroups {
+		raftGroupID := proto.RaftID(groupID)
+		g, ok := s.groups[raftGroupID]
+		if !ok {
+			if log.V(4) {
+				log.Infof("dropping stale write to group %v", groupID)
+			}
+			continue
+		} else if !g.writing {
+			if log.V(4) {
+				log.Infof("dropping stale write to reincarnation of group %v", groupID)
+			}
+			delete(readyGroups, groupID) // they must not make it to Advance.
+			continue
+		}
+		g.writing = false
+
+		// Process committed entries.
+		for _, entry := range ready.CommittedEntries {
+			commandID := s.processCommittedEntry(raftGroupID, g, entry)
+			// TODO(bdarnell): the command is now committed, but not applied until the
+			// application consumes EventCommandCommitted. Is returning via the channel
+			// at this point useful or do we need to wait for the command to be
+			// applied too?
+			// This could be done with a Callback as in EventMembershipChangeCommitted
+			// or perhaps we should move away from a channel to a callback-based system.
+			s.removePending(g, g.pending[commandID], nil /* err */)
+		}
+
+		if !raft.IsEmptySnap(ready.Snapshot) {
+			// Sync the group/node mapping with the information contained in the snapshot.
+			for _, nodeID := range ready.Snapshot.Metadata.ConfState.Nodes {
+				// TODO(bdarnell): if we had any information that predated this snapshot
+				// we must remove those nodes.
+				if err := s.addNode(proto.RaftNodeID(nodeID), raftGroupID); err != nil {
+					log.Errorf("node %v: error adding node %v", s.nodeID, nodeID)
+				}
+			}
+		}
+
+		// Process SoftState and leader changes.
+		s.maybeSendLeaderEvent(raftGroupID, g, &ready)
+
+		// Send all messages.
+		for _, msg := range ready.Messages {
+			switch msg.Type {
+			case raftpb.MsgHeartbeat:
+				if log.V(8) {
+					log.Infof("node %v dropped individual heartbeat to node %v",
+						s.nodeID, msg.To)
+				}
+			case raftpb.MsgHeartbeatResp:
+				if log.V(8) {
+					log.Infof("node %v dropped individual heartbeat response to node %v",
+						s.nodeID, msg.To)
+				}
+			default:
+				s.sendMessage(raftGroupID, msg)
+			}
+		}
 	}
 }

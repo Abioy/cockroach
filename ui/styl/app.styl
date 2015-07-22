@@ -1,0 +1,109 @@
+/**
+Copyright 2015 The Cockroach Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied. See the License for the specific language governing
+permissions and limitations under the License. See the AUTHORS file
+for names of contributors.
+
+Author: Matt Tracy (matt@cockroachlabs.com)
+*/
+
+// ---- Color Palette ----
+$palette = {
+  // Light basic content color, shaded from lightest to darkest.
+  'light': {
+    '0': #ffffff,
+    '1': #f1f2f3,
+    '2': #EEE,
+    '3': #DDD,
+    '4': #CCC
+  },
+  // Dark basic content color, shaded from darkest to lightest.
+  'dark': {
+      '0': #292929,
+      '1': #333333,
+      '2': #414141,
+      '3': #555555,
+      '4': #666666,
+  },
+}
+
+$color(base, val)
+  return $palette[base][val]
+
+
+// ---- Top Level Elements ----
+*
+  margin: 0
+  padding: 0
+  -moz-box-sizing: border-box
+  -webkit-box-sizing: border-box
+  box-sizing: border-box
+
+html,
+body
+  height: 100%
+
+body
+  background-color: $color('light', '1')
+  color: $color('dark', '1')
+  font-family: 'Source Sans Pro', 'Helvetica Neue', Helvetica, sans-serif
+  font-weight: 400
+  font-size: 14px
+
+.fullHeightContainer
+  height: calc(100% - 50px)
+  /* Keep in line with height of .appNav */
+
+// ---- Navigation ----
+.appNav
+  height: 50px
+  background-color: $color('dark', '0')
+  border-bottom: 1px solid $color('dark', '1')
+  padding: 10px 20px
+
+.appNav-link:link,
+.appNav-link:visited
+  text-decoration: none
+  text-transform: uppercase
+  color: $color('light', '1')
+  display: inline-block
+  margin-right: 20px
+
+.appNav-link.appNav-homeName
+  font-weight: 800
+  font-size: 22px
+  text-transform: none
+  vertical-align: -2px
+
+// ---- Data table ---- 
+.stats-table
+  table
+    border-collapse: collapse;
+  tr
+    height: 2em
+    border-bottom: 1px solid $color('light', '4')
+    &:first-child
+      border-top: 1px solid $color('light', '4')
+  th
+    background-color: $color('light', '0')
+  td
+    background-color: $color('light', '3')
+    &:nth-child(even)
+      background-color: $color('light', '2')
+    &:first-child
+      background-color: $color('light', '1')
+
+  td
+  th
+    padding-left: 1em
+    padding-right: 1em

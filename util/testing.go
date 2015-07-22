@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -22,20 +22,27 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"reflect"
 	"time"
-
-	"github.com/golang/glog"
 )
 
+// Tester is a proxy for e.g. testing.T which does not introduce a dependency
+// on "testing".
+type Tester interface {
+	Fatal(args ...interface{})
+	Fatalf(format string, args ...interface{})
+}
+
 // tempUnixFile creates a temporary file for use with a unix domain socket.
+// TODO(bdarnell): use TempDir instead to make this atomic.
 func tempUnixFile() string {
 	f, err := ioutil.TempFile("", "unix-socket")
 	if err != nil {
-		glog.Fatalf("unable to create temp file: %s", err)
+		panic(fmt.Sprintf("unable to create temp file: %s", err))
 	}
 	f.Close()
-	os.Remove(f.Name())
+	if err := os.Remove(f.Name()); err != nil {
+		panic(fmt.Sprintf("unable to remove temp file: %s", err))
+	}
 	return f.Name()
 }
 
@@ -43,6 +50,43 @@ func tempUnixFile() string {
 // increasing port number in the range [minLocalhostPort, ...].
 func tempLocalhostAddr() string {
 	return "127.0.0.1:0"
+}
+
+// CreateTempDir creates a temporary directory and returns its path.
+// You should usually call defer CleanupDir(dir) right after.
+func CreateTempDir(t Tester, prefix string) string {
+	dir, err := ioutil.TempDir("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// CreateNTempDirs creates N temporary directories and returns a slice
+// of paths.
+// You should usually call defer CleanupDirs(dirs) right after.
+func CreateNTempDirs(t Tester, prefix string, n int) []string {
+	dirs := make([]string, n)
+	var err error
+	for i := 0; i < n; i++ {
+		dirs[i], err = ioutil.TempDir("", prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dirs
+}
+
+// CleanupDir removes the passed-in directory and all contents. Errors are ignored.
+func CleanupDir(dir string) {
+	_ = os.RemoveAll(dir)
+}
+
+// CleanupDirs removes all passed-in directories and their contents. Errors are ignored.
+func CleanupDirs(dirs []string) {
+	for _, dir := range dirs {
+		_ = os.RemoveAll(dir)
+	}
 }
 
 // CreateTestAddr creates an unused address for testing. The "network"
@@ -67,72 +111,50 @@ func CreateTestAddr(network string) net.Addr {
 
 // IsTrueWithin returns an error if the supplied function fails to
 // evaluate to true within the specified duration. The function is
-// invoked at most 50 times over the course of the specified time
+// invoked immediately at first and then successively with an
+// exponential backoff starting at 1ns and ending at the specified
 // duration.
+//
+// This method is deprecated; use SucceedsWithin instead.
+// TODO(bdarnell): convert existing uses of IsTrueWithin to SucceedsWithin.
 func IsTrueWithin(trueFunc func() bool, duration time.Duration) error {
-	for i := 0; i < 50; i++ {
+	total := time.Duration(0)
+	for wait := time.Duration(1); total < duration; wait *= 2 {
 		if trueFunc() {
 			return nil
 		}
-		time.Sleep(duration / 50)
+		time.Sleep(wait)
+		total += wait
 	}
-	return fmt.Errorf("condition failed to evaluate true within %s", duration)
+	return ErrorfSkipFrames(1, "condition failed to evaluate true within %s", duration)
 }
 
-// ContainsSameElements compares, without taking order on the
-// first level, the contents of two slices of the same type.
-// The elements of the slice must have comparisons defined,
-// otherwise a panic will result.
-func ContainsSameElements(s1, s2 interface{}) bool {
-	// TODO add support for chans when needed.
-	// Preliminary checks to weed out incompatible inputs.
-	if reflect.TypeOf(s1).Kind() != reflect.Slice || reflect.TypeOf(s2).Kind() != reflect.Slice {
-		panic("received non-slice argument")
-	}
-	if reflect.TypeOf(s1) != reflect.TypeOf(s2) {
-		panic("received slices with incompatible types")
-	}
-
-	// Create a map that keeps a count of how often we see
-	// each element in the slices.
-	m := reflect.MakeMap(reflect.MapOf(reflect.TypeOf(s1).Elem(), reflect.TypeOf(uint64(0))))
-
-	// Get the actual slices we are comparing.
-	rs1 := reflect.ValueOf(s1)
-	rs2 := reflect.ValueOf(s2)
-
-	var zeroValue reflect.Value
-
-	if rs1.Len() != rs2.Len() {
-		return false
-	}
-
-	// Fill the counting hash map using the first slice.
-	for i := 0; i < rs1.Len(); i++ {
-		v := rs1.Index(i)
-		k := m.MapIndex(v)
-		if k == zeroValue {
-			// The entry did not exist, so the new count is 1.
-			m.SetMapIndex(v, reflect.ValueOf(uint64(1)))
-		} else {
-			m.SetMapIndex(v, reflect.ValueOf(k.Uint()+uint64(1)))
+// SucceedsWithin fails the test (with t.Fatal) unless the supplied
+// function runs without error within the specified duration. The
+// function is invoked immediately at first and then successively with
+// an exponential backoff starting at 1ns and ending at the specified
+// duration.
+func SucceedsWithin(t Tester, duration time.Duration, fn func() error) {
+	deadline := time.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); time.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return
 		}
-	}
-
-	// Compare the counts from s1 against the second slice.
-	for i := 0; i < rs2.Len(); i++ {
-		v := rs2.Index(i)
-		k := m.MapIndex(v)
-		if k == zeroValue {
-			return false
-		} else if k.Uint() == 1 {
-			// Setting the zero value removes the entry.
-			m.SetMapIndex(v, zeroValue)
-		} else {
-			m.SetMapIndex(v, reflect.ValueOf(k.Uint()-uint64(1)))
+		if wait > time.Second {
+			wait = time.Second
 		}
+		time.Sleep(wait)
 	}
+	t.Fatal(ErrorfSkipFrames(1, "condition failed to evaluate within %s: %s", duration, lastErr))
+}
 
-	// If all went well until here, the map is now empty.
-	return m.Len() == 0
+// Panics calls the supplied function and returns true if and only if it panics.
+func Panics(f func()) (panics bool) {
+	defer func() {
+		panics = recover() != nil
+	}()
+	f()
+	return
 }

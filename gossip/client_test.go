@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -21,43 +21,82 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
 )
 
-func init() {
+const (
 	// With the default gossip interval, some tests
 	// may take longer than they need.
-	*GossipInterval = 20 * time.Millisecond
-}
+	gossipInterval = 20 * time.Millisecond
+)
 
 // startGossip creates local and remote gossip instances.
 // The remote gossip instance launches its gossip service.
-func startGossip(t *testing.T) (local, remote *Gossip, lserver, rserver *rpc.Server) {
-	laddr := util.CreateTestAddr("unix")
-	lserver = rpc.NewServer(laddr)
-	lserver.Start()
-	local = New()
-	raddr := util.CreateTestAddr("unix")
-	rserver = rpc.NewServer(raddr)
-	rserver.Start()
-	remote = New()
-	local.start(lserver)
-	remote.start(rserver)
+func startGossip(t *testing.T) (local, remote *Gossip, stopper *stop.Stopper) {
+	lclock := hlc.NewClock(hlc.UnixNano)
+	stopper = stop.NewStopper()
+	lRPCContext := rpc.NewContext(nodeTestBaseContext, lclock, stopper)
+
+	laddr := util.CreateTestAddr("tcp")
+	lserver := rpc.NewServer(laddr, lRPCContext)
+	if err := lserver.Start(); err != nil {
+		t.Fatal(err)
+	}
+	local = New(lRPCContext, gossipInterval, TestBootstrap)
+	if err := local.SetNodeDescriptor(&proto.NodeDescriptor{
+		NodeID: 1,
+		Address: proto.Addr{
+			Network: laddr.Network(),
+			Address: laddr.String(),
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	rclock := hlc.NewClock(hlc.UnixNano)
+	raddr := util.CreateTestAddr("tcp")
+	rRPCContext := rpc.NewContext(nodeTestBaseContext, rclock, stopper)
+	rserver := rpc.NewServer(raddr, rRPCContext)
+	if err := rserver.Start(); err != nil {
+		t.Fatal(err)
+	}
+	remote = New(rRPCContext, gossipInterval, TestBootstrap)
+	if err := local.SetNodeDescriptor(&proto.NodeDescriptor{
+		NodeID: 2,
+		Address: proto.Addr{
+			Network: raddr.Network(),
+			Address: raddr.String(),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	local.start(lserver, stopper)
+	remote.start(rserver, stopper)
 	time.Sleep(time.Millisecond)
 	return
 }
 
 // TestClientGossip verifies a client can gossip a delta to the server.
 func TestClientGossip(t *testing.T) {
-	local, remote, lserver, rserver := startGossip(t)
-	local.AddInfo("local-key", "local value", time.Second)
-	remote.AddInfo("remote-key", "remote value", time.Second)
+	defer leaktest.AfterTest(t)
+	local, remote, stopper := startGossip(t)
+	if err := local.AddInfo("local-key", "local value", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.AddInfo("remote-key", "remote value", time.Second); err != nil {
+		t.Fatal(err)
+	}
 	disconnected := make(chan *client, 1)
 
 	client := newClient(remote.is.NodeAddr)
-	go client.start(local, disconnected)
+	// Use an insecure context. We're talking to unix socket which are not in the certs.
+	lclock := hlc.NewClock(hlc.UnixNano)
+	rpcContext := rpc.NewContext(nodeTestBaseContext, lclock, stopper)
+	client.start(local, disconnected, rpcContext, stopper)
 
 	if err := util.IsTrueWithin(func() bool {
 		_, lerr := remote.GetInfo("local-key")
@@ -67,11 +106,8 @@ func TestClientGossip(t *testing.T) {
 		t.Errorf("gossip exchange failed or taking too long")
 	}
 
-	remote.stop()
-	local.stop()
-	lserver.Close()
-	rserver.Close()
-	glog.Info("done serving")
+	stopper.Stop()
+	log.Info("done serving")
 	if client != <-disconnected {
 		t.Errorf("expected client disconnect after remote close")
 	}
@@ -81,28 +117,28 @@ func TestClientGossip(t *testing.T) {
 // will drop an outgoing client connection that is already an
 // inbound client connection of another node.
 func TestClientDisconnectRedundant(t *testing.T) {
-	local, remote, _, _ := startGossip(t)
+	defer leaktest.AfterTest(t)
+	local, remote, stopper := startGossip(t)
+	defer stopper.Stop()
 	// startClient doesn't lock the underlying gossip
 	// object, so we acquire those locks here.
 	local.mu.Lock()
 	remote.mu.Lock()
 	rAddr := remote.is.NodeAddr
 	lAddr := local.is.NodeAddr
-	local.startClient(rAddr)
-	remote.startClient(lAddr)
+	lclock := hlc.NewClock(hlc.UnixNano)
+	rpcContext := rpc.NewContext(nodeTestBaseContext, lclock, stopper)
+	local.startClient(rAddr, rpcContext, stopper)
+	remote.startClient(lAddr, rpcContext, stopper)
 	local.mu.Unlock()
 	remote.mu.Unlock()
-	go local.manage()
-	go remote.manage()
+	local.manage(stopper)
+	remote.manage(stopper)
 	wasConnected1, wasConnected2 := false, false
 	if err := util.IsTrueWithin(func() bool {
 		// Check which of the clients is connected to the other.
-		local.clientsMu.Lock()
-		defer local.clientsMu.Unlock()
-		remote.clientsMu.Lock()
-		defer remote.clientsMu.Unlock()
-		_, ok1 := local.clients[rAddr.String()]
-		_, ok2 := remote.clients[lAddr.String()]
+		ok1 := local.findClient(func(c *client) bool { return c.addr.String() == rAddr.String() }) != nil
+		ok2 := remote.findClient(func(c *client) bool { return c.addr.String() == lAddr.String() }) != nil
 		if ok1 {
 			wasConnected1 = true
 		}
@@ -118,7 +154,7 @@ func TestClientDisconnectRedundant(t *testing.T) {
 			return true
 		}
 		return false
-	}, 500*time.Millisecond); err != nil {
-		t.Fatalf("timeout reached before redundant client connection was closed")
+	}, 10*time.Second); err != nil {
+		t.Fatal(err)
 	}
 }

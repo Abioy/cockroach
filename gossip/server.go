@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -25,84 +25,116 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
+	gogoproto "github.com/gogo/protobuf/proto"
 )
+
+type clientInfo struct {
+	id   proto.NodeID
+	addr *proto.Addr
+}
 
 // server maintains an array of connected peers to which it gossips
 // newly arrived information on a periodic basis.
 type server struct {
-	interval      time.Duration       // Interval at which to gossip fresh info
-	mu            sync.Mutex          // Mutex protects is (infostore) & incoming
-	ready         *sync.Cond          // Broadcasts wakeup to waiting gossip requests
-	is            *infoStore          // The backing infostore
-	closed        bool                // True if server was closed
-	incoming      *addrSet            // Incoming client addresses
-	clientAddrMap map[string]net.Addr // Incoming client's local address -> client's server address
+	interval time.Duration // Interval at which to gossip fresh info
+	ready    *sync.Cond    // Broadcasts wakeup to waiting gossip requests
+
+	mu       sync.Mutex            // Protects the fields below
+	is       *infoStore            // The backing infostore
+	closed   bool                  // True if server was closed
+	incoming *nodeSet              // Incoming client node IDs
+	lAddrMap map[string]clientInfo // Incoming client's local address -> client's node info
 }
 
 // newServer creates and returns a server struct.
 func newServer(interval time.Duration) *server {
 	s := &server{
-		is:            newInfoStore(nil),
-		interval:      interval,
-		incoming:      newAddrSet(MaxPeers),
-		clientAddrMap: make(map[string]net.Addr),
+		is:       newInfoStore(0, nil),
+		interval: interval,
+		incoming: newNodeSet(MaxPeers),
+		lAddrMap: map[string]clientInfo{},
 	}
 	s.ready = sync.NewCond(&s.mu)
 	return s
 }
 
-// Gossip receives gossipped information from a peer node.
+// Gossip receives gossiped information from a peer node.
 // The received delta is combined with the infostore, and this
 // node's own gossip is returned to requesting client.
-func (s *server) Gossip(args *GossipRequest, reply *GossipResponse) error {
+func (s *server) Gossip(argsI gogoproto.Message) (gogoproto.Message, error) {
+	args := argsI.(*proto.GossipRequest)
+	reply := &proto.GossipResponse{}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	addr, err := args.Addr.NetAddr()
+	if err != nil {
+		return nil, util.Errorf("addr %s could not be converted to net.Addr: %s", args.Addr, err)
+	}
+	lAddr, err := args.LAddr.NetAddr()
+	if err != nil {
+		return nil, util.Errorf("local addr %s could not be converted to net.Addr: %s", args.LAddr, err)
+	}
+
 	// If there is no more capacity to accept incoming clients, return
 	// a random already-being-serviced incoming client as an alternate.
-	if !s.incoming.hasAddr(args.Addr) {
+	if !s.incoming.hasNode(args.NodeID) {
 		if !s.incoming.hasSpace() {
-			reply.Alternate = s.incoming.selectRandom()
-			return nil
+			idx := rand.Intn(len(s.lAddrMap))
+			count := 0
+			for _, cInfo := range s.lAddrMap {
+				if count == idx {
+					reply.Alternate = cInfo.addr
+					return reply, nil
+				}
+				count++
+			}
 		}
-		s.incoming.addAddr(args.Addr)
+		s.incoming.addNode(args.NodeID)
 		// This lookup map allows the incoming client to be removed from
 		// the incoming addr set when its connection is closed. See
 		// server.serveConn() below.
-		s.clientAddrMap[args.LAddr.String()] = args.Addr
+		s.lAddrMap[lAddr.String()] = clientInfo{args.NodeID, &args.Addr}
 	}
 
-	// Update infostore with gossipped infos.
+	// Update infostore with gossiped infos.
 	if args.Delta != nil {
-		glog.V(1).Infof("received delta infostore from client %s: %s", args.Addr, args.Delta)
-		s.is.combine(args.Delta)
+		delta := &infoStore{}
+		if err := gob.NewDecoder(bytes.NewBuffer(args.Delta)).Decode(delta); err != nil {
+			return nil, util.Errorf("infostore could not be decoded: %s", err)
+		}
+		if delta.infoCount() > 0 {
+			if log.V(1) {
+				log.Infof("gossip: received %s", delta)
+			} else {
+				log.Infof("gossip: received %d info(s) from %s", delta.infoCount(), addr)
+			}
+		}
+		s.is.combine(delta)
+	}
+	// The exit condition for waiting clients.
+	if s.closed {
+		return nil, util.Errorf("gossip server shutdown")
 	}
 	// If requested max sequence is not -1, wait for gossip interval to expire.
 	if args.MaxSeq != -1 {
 		s.ready.Wait()
 	}
-	// The exit condition for waiting clients.
-	if s.closed {
-		return util.Errorf("gossip server shutdown")
-	}
 	// Return reciprocal delta.
-	delta := s.is.delta(args.Addr, args.MaxSeq)
+	delta := s.is.delta(args.NodeID, args.MaxSeq)
 	if delta != nil {
-		// If V(1), double check that we can gob-encode the infostore.
-		// Problems here seem to very confusingly disappear into the RPC internals.
-		if glog.V(1) {
-			var buf bytes.Buffer
-			if err := gob.NewEncoder(&buf).Encode(delta); err != nil {
-				glog.Fatalf("infostore could not be encoded: %v", err)
-			}
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(delta); err != nil {
+			log.Fatalf("infostore could not be encoded: %s", err)
 		}
-		reply.Delta = delta
-		glog.Infof("gossip: client %s sent %d info(s)", args.Addr, delta.infoCount())
+		reply.Delta = buf.Bytes()
 	}
-	return nil
+	return reply, nil
 }
 
 // jitteredGossipInterval returns a randomly jittered duration from
@@ -115,22 +147,26 @@ func (s *server) jitteredGossipInterval() time.Duration {
 // then begins processing connecting clients in an infinite select
 // loop via goroutine. Periodically, clients connected and awaiting
 // the next round of gossip are awoken via the conditional variable.
-func (s *server) start(rpcServer *rpc.Server) {
+func (s *server) start(rpcServer *rpc.Server, stopper *stop.Stopper) {
 	s.is.NodeAddr = rpcServer.Addr()
-	rpcServer.RegisterName("Gossip", s)
+	if err := rpcServer.Register("Gossip.Gossip", s.Gossip, &proto.GossipRequest{}); err != nil {
+		log.Fatalf("unable to register gossip service with RPC server: %s", err)
+	}
 	rpcServer.AddCloseCallback(s.onClose)
 
-	go func() {
+	stopper.RunWorker(func() {
 		// Periodically wakeup blocked client gossip requests.
-		gossipTimeout := time.Tick(s.jitteredGossipInterval())
 		for {
 			select {
-			case <-gossipTimeout:
+			case <-time.After(s.jitteredGossipInterval()):
 				// Wakeup all blocked gossip requests.
 				s.ready.Broadcast()
+			case <-stopper.ShouldStop():
+				s.stop()
+				return
 			}
 		}
-	}()
+	})
 }
 
 // stop sets the server's closed bool to true and broadcasts to
@@ -147,7 +183,7 @@ func (s *server) stop() {
 func (s *server) onClose(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if clientAddr, ok := s.clientAddrMap[conn.RemoteAddr().String()]; ok {
-		s.incoming.removeAddr(clientAddr)
+	if cInfo, ok := s.lAddrMap[conn.RemoteAddr().String()]; ok {
+		s.incoming.removeNode(cInfo.id)
 	}
 }

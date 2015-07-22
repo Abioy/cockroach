@@ -9,304 +9,297 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
 // Author: Andrew Bonventre (andybons@gmail.com)
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-// Package server implements a basic HTTP server for interacting with a node.
 package server
 
 import (
 	"compress/gzip"
-	"flag"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
-	"regexp"
-	"sort"
-	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	commander "code.google.com/p/go-commander"
+	"github.com/cockroachdb/c-snappy"
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/gossip/resolver"
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
+	"github.com/cockroachdb/cockroach/multiraft"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/server/status"
+	"github.com/cockroachdb/cockroach/sql"
+	"github.com/cockroachdb/cockroach/sql/sqlwire"
 	"github.com/cockroachdb/cockroach/storage"
-	"github.com/cockroachdb/cockroach/structured"
+	"github.com/cockroachdb/cockroach/ts"
+	"github.com/cockroachdb/cockroach/ui"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/tracer"
+	assetfs "github.com/elazarl/go-bindata-assetfs"
 )
 
 var (
-	rpcAddr  = flag.String("rpc_addr", ":0", "host:port to bind for RPC traffic; 0 to pick unused port")
-	httpAddr = flag.String("http_addr", ":8080", "host:port to bind for HTTP traffic; 0 to pick unused port")
-
-	// stores is specified to enable durable storage via RocksDB-backed
-	// key-value stores. Memory-backed key value stores may be
-	// optionally specified via mem=<integer byte size>.
-	stores = flag.String("stores", "", "specify a comma-separated list of stores, "+
-		"specified by a colon-separated list of device attributes followed by '=' and "+
-		"either a filepath for a persistent store or an integer size in bytes for an "+
-		"in-memory store. Device attributes typically include whether the store is "+
-		"flash (ssd), spinny disk (hdd), fusion-io (fio), in-memory (mem); device "+
-		"attributes might also include speeds and other specs (7200rpm, 200kiops, etc.). "+
-		"For example, -store=hdd:7200rpm=/mnt/hda1,ssd=/mnt/ssd01,ssd=/mnt/ssd02,mem=1073741824")
-
-	// attrs specifies node topography or machine capabilities, used to
-	// match capabilities or location preferences specified in zone configs.
-	attrs = flag.String("attrs", "", "specify a comma-separated list of node "+
-		"attributes. Attributes are arbitrary strings specifying topography or "+
-		"machine capabilities. Topography might include datacenter designation (e.g. "+
-		"\"us-west-1a\", \"us-west-1b\", \"us-east-1c\"). Machine capabilities "+
-		"might include specialized hardware or number of cores (e.g. \"gpu\", "+
-		"\"x16c\"). For example: -attrs=us-west-1b,gpu")
-
-	// Regular expression for capturing data directory specifications.
-	storesRE = regexp.MustCompile(`([^=]+)=([^,]+)(,|$)`)
+	// Allocation pool for gzip writers.
+	gzipWriterPool sync.Pool
+	// Allocation pool for snappy writers.
+	snappyWriterPool sync.Pool
 )
 
-// A CmdStart command starts nodes by joining the gossip network.
-var CmdStart = &commander.Command{
-	UsageLine: "start -gossip=host1:port1[,host2:port2...] " +
-		"-stores=(ssd=<data-dir>|hdd=<data-dir>|mem=<capacity-in-bytes>)[,...]",
-	Short: "start node by joining the gossip network",
-	Long: fmt.Sprintf(`
+// Server is the cockroach server node.
+type Server struct {
+	ctx *Context
 
-Start Cockroach node by joining the gossip network and exporting key
-ranges stored on physical device(s). The gossip network is joined by
-contacting one or more well-known hosts specified by the -gossip
-command line flag. Every node should be run with the same list of
-bootstrap hosts to guarantee a connected network. An alternate
-approach is to use a single host for -gossip and round-robin DNS.
-
-Each node exports data from one or more physical devices. These
-devices are specified via the -stores command line flag. This is a
-comma-separated list of paths to storage directories or for in-memory
-stores, the number of bytes. Although the paths should be specified to
-correspond uniquely to physical devices, this requirement isn't
-strictly enforced.
-
-A node exports an HTTP API with the following endpoints:
-
-  Health check:           /healthz
-  Key-value REST:         %s
-  Structured Schema REST: %s
-`, kv.KVKeyPrefix, structured.StructuredKeyPrefix),
-	Run:  runStart,
-	Flag: *flag.CommandLine,
+	mux           *http.ServeMux
+	clock         *hlc.Clock
+	rpc           *rpc.Server
+	gossip        *gossip.Gossip
+	db            *client.DB
+	kvDB          *kv.DBServer
+	sqlServer     *sql.Server
+	node          *Node
+	recorder      *status.NodeStatusRecorder
+	admin         *adminServer
+	status        *statusServer
+	tsDB          *ts.DB
+	tsServer      *ts.Server
+	raftTransport multiraft.Transport
+	stopper       *stop.Stopper
 }
 
-type server struct {
-	host           string
-	mux            *http.ServeMux
-	rpc            *rpc.Server
-	gossip         *gossip.Gossip
-	kvDB           kv.DB
-	kvREST         *kv.RESTServer
-	node           *Node
-	admin          *adminServer
-	structuredDB   *structured.DB
-	structuredREST *structured.RESTServer
-	httpListener   *net.Listener // holds http endpoint information
-}
+// NewServer creates a Server from a server.Context.
+func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
+	if ctx == nil {
+		return nil, util.Error("ctx must not be null")
+	}
 
-// runStart starts the cockroach node using -stores as the list of
-// storage devices ("stores") on this machine and -gossip as the list
-// of "well-known" hosts used to join this node to the cockroach
-// cluster via the gossip network.
-func runStart(cmd *commander.Command, args []string) {
-	glog.Info("Starting cockroach cluster")
-	s, err := newServer()
+	addr := ctx.Addr
+	_, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		glog.Errorf("Failed to start Cockroach server: %v", err)
-		return
+		return nil, util.Errorf("unable to resolve RPC address %q: %v", addr, err)
 	}
-	// Init engines from -stores.
-	engines, err := initEngines(*stores)
+
+	if ctx.Insecure {
+		log.Warning("running in insecure mode, this is strongly discouraged. See --insecure and --certs.")
+	}
+	// Try loading the TLS configs before anything else.
+	if _, err := ctx.GetServerTLSConfig(); err != nil {
+		return nil, err
+	}
+	if _, err := ctx.GetClientTLSConfig(); err != nil {
+		return nil, err
+	}
+
+	s := &Server{
+		ctx:     ctx,
+		mux:     http.NewServeMux(),
+		clock:   hlc.NewClock(hlc.UnixNano),
+		stopper: stopper,
+	}
+	s.clock.SetMaxOffset(ctx.MaxOffset)
+
+	rpcContext := rpc.NewContext(&ctx.Context, s.clock, stopper)
+	stopper.RunWorker(func() {
+		rpcContext.RemoteClocks.MonitorRemoteOffsets(stopper)
+	})
+
+	s.rpc = rpc.NewServer(util.MakeUnresolvedAddr("tcp", addr), rpcContext)
+	s.stopper.AddCloser(s.rpc)
+	s.gossip = gossip.New(rpcContext, s.ctx.GossipInterval, s.ctx.GossipBootstrapResolvers)
+
+	feed := &util.Feed{}
+	tracer := tracer.NewTracer(feed, addr)
+
+	ds := kv.NewDistSender(&kv.DistSenderContext{Clock: s.clock}, s.gossip)
+	sender := kv.NewTxnCoordSender(ds, s.clock, ctx.Linearizable, tracer, s.stopper)
+	if s.db, err = client.Open("//root@", client.SenderOpt(sender)); err != nil {
+		return nil, err
+	}
+
+	s.raftTransport, err = newRPCTransport(s.gossip, s.rpc, rpcContext)
 	if err != nil {
-		glog.Errorf("Failed to initialize engines from -stores=%q: %v", *stores, err)
-		return
+		return nil, err
 	}
-	if len(engines) == 0 {
-		glog.Errorf("No valid engines specified after initializing from -stores=%q", *stores)
-		return
-	}
+	s.stopper.AddCloser(s.raftTransport)
 
-	err = s.start(engines, false)
-	defer s.stop()
-	if err != nil {
-		glog.Errorf("Cockroach server exited with error: %v", err)
-		return
-	}
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, os.Kill)
-
-	// Block until one of the signals above is received.
-	<-c
-}
-
-// parseAttributes parses a colon-separated list of strings,
-// filtering empty strings (i.e. ",," will yield no attributes.
-// Returns the list of strings as Attributes.
-func parseAttributes(attrsStr string) storage.Attributes {
-	var filtered []string
-	for _, attr := range strings.Split(attrsStr, ":") {
-		if len(attr) != 0 {
-			filtered = append(filtered, attr)
-		}
-	}
-	sort.Strings(filtered)
-	return storage.Attributes(filtered)
-}
-
-// initEngines interprets the stores parameter to initialize a slice of
-// storage.Engine objects.
-func initEngines(stores string) ([]storage.Engine, error) {
-	// Error if regexp doesn't match.
-	storeSpecs := storesRE.FindAllStringSubmatch(stores, -1)
-	if storeSpecs == nil || len(storeSpecs) == 0 {
-		return nil, util.Errorf("invalid or empty engines specification %q", stores)
-	}
-
-	engines := []storage.Engine{}
-	for _, store := range storeSpecs {
-		if len(store) != 4 {
-			return nil, util.Errorf("unable to parse attributes and path from store %q", store[0])
-		}
-		// There are two matches for each store specification: the colon-separated
-		// list of attributes and the path.
-		engine, err := initEngine(store[1], store[2])
-		if err != nil {
-			return nil, util.Errorf("unable to init engine for store %q: %v", store[0], err)
-		}
-		engines = append(engines, engine)
-	}
-
-	return engines, nil
-}
-
-// initEngine parses the store attributes as a colon-separated list
-// and instantiates an engine based on the dir parameter. If dir parses
-// to an integer, it's taken to mean an in-memory engine; otherwise,
-// dir is treated as a path and a RocksDB engine is created.
-func initEngine(attrsStr, path string) (storage.Engine, error) {
-	attrs := parseAttributes(attrsStr)
-	var engine storage.Engine
-	if size, err := strconv.ParseUint(path, 10, 64); err == nil {
-		if size == 0 {
-			return nil, util.Errorf("unable to initialize an in-memory store with capacity 0")
-		}
-		engine = storage.NewInMem(attrs, int64(size))
-	} else {
-		engine, err = storage.NewRocksDB(attrs, path)
-		if err != nil {
-			return nil, util.Errorf("unable to init rocksdb with data dir %q: %v", path, err)
+	s.kvDB = kv.NewDBServer(&s.ctx.Context, sender)
+	if s.ctx.ExperimentalRPCServer {
+		if err = s.kvDB.RegisterRPC(s.rpc); err != nil {
+			return nil, err
 		}
 	}
 
-	return engine, nil
-}
+	s.sqlServer = sql.NewServer(&s.ctx.Context, s.db)
 
-func newServer() (*server, error) {
-	// Determine hostname in case it hasn't been specified in -rpc_addr or -http_addr.
-	host, err := os.Hostname()
-	if err != nil {
-		host = "127.0.0.1"
+	// TODO(bdarnell): make StoreConfig configurable.
+	nCtx := storage.StoreContext{
+		Clock:           s.clock,
+		DB:              s.db,
+		Gossip:          s.gossip,
+		Transport:       s.raftTransport,
+		ScanInterval:    s.ctx.ScanInterval,
+		ScanMaxIdleTime: s.ctx.ScanMaxIdleTime,
+		EventFeed:       feed,
+		Tracer:          tracer,
 	}
-
-	// Resolve
-	if strings.HasPrefix(*rpcAddr, ":") {
-		*rpcAddr = host + *rpcAddr
-	}
-	addr, err := net.ResolveTCPAddr("tcp", *rpcAddr)
-	if err != nil {
-		return nil, util.Errorf("unable to resolve RPC address %q: %v", *rpcAddr, err)
-	}
-
-	s := &server{
-		host: host,
-		mux:  http.NewServeMux(),
-		rpc:  rpc.NewServer(addr),
-	}
-
-	s.gossip = gossip.New()
-	s.kvDB = kv.NewDB(s.gossip)
-	s.kvREST = kv.NewRESTServer(s.kvDB)
-	s.node = NewNode(s.kvDB, s.gossip)
-	s.admin = newAdminServer(s.kvDB)
-	s.structuredDB = structured.NewDB(s.kvDB)
-	s.structuredREST = structured.NewRESTServer(s.structuredDB)
+	s.node = NewNode(nCtx)
+	s.admin = newAdminServer(s.db, s.stopper)
+	s.status = newStatusServer(s.db, s.gossip, ctx)
+	s.tsDB = ts.NewDB(s.db)
+	s.tsServer = ts.NewServer(s.tsDB)
+	s.stopper.AddCloser(nCtx.EventFeed)
 
 	return s, nil
 }
 
-// start runs the RPC and HTTP servers, starts the gossip instance (if
+// Start runs the RPC and HTTP servers, starts the gossip instance (if
 // selfBootstrap is true, uses the rpc server's address as the gossip
 // bootstrap), and starts the node using the supplied engines slice.
-func (s *server) start(engines []storage.Engine, selfBootstrap bool) error {
-	s.rpc.Start() // bind RPC socket and launch goroutine.
-	glog.Infof("Started RPC server at %s", s.rpc.Addr())
+func (s *Server) Start(selfBootstrap bool) error {
+	if err := s.rpc.Listen(); err != nil {
+		return util.Errorf("could not listen on %s: %s", s.ctx.Addr, err)
+	}
 
 	// Handle self-bootstrapping case for a single node.
 	if selfBootstrap {
-		s.gossip.SetBootstrap([]net.Addr{s.rpc.Addr()})
-	}
-	s.gossip.Start(s.rpc)
-	glog.Infoln("Started gossip instance")
-
-	// Init the engines specified via command line flags if not supplied.
-	if engines == nil {
-		var err error
-		engines, err = initEngines(*stores)
+		selfResolver, err := resolver.NewResolver(&s.ctx.Context, s.rpc.Addr().String())
 		if err != nil {
 			return err
 		}
+		s.gossip.SetResolvers([]resolver.Resolver{selfResolver})
 	}
+	s.gossip.Start(s.rpc, s.stopper)
 
-	// Init the node attributes from the -attrs command line flag.
-	nodeAttrs := parseAttributes(*attrs)
-
-	if err := s.node.start(s.rpc, engines, nodeAttrs); err != nil {
+	if err := s.node.start(s.rpc, s.ctx.Engines, s.ctx.NodeAttributes, s.stopper); err != nil {
 		return err
 	}
-	glog.Infof("Initialized %d storage engine(s)", len(engines))
 
+	// Begin recording runtime statistics.
+	runtime := status.NewRuntimeStatRecorder(s.node.Descriptor.NodeID, s.clock)
+	s.tsDB.PollSource(runtime, s.ctx.MetricsFrequency, ts.Resolution10s, s.stopper)
+
+	// Begin recording time series data collected by the status monitor.
+	s.recorder = status.NewNodeStatusRecorder(s.node.status, s.clock)
+	s.tsDB.PollSource(s.recorder, s.ctx.MetricsFrequency, ts.Resolution10s, s.stopper)
+
+	// Begin recording status summaries.
+	s.startWriteSummaries()
+
+	log.Infof("starting %s server at %s", s.ctx.RequestScheme(), s.rpc.Addr())
+	// TODO(spencer): go1.5 is supposed to allow shutdown of running http server.
 	s.initHTTP()
-	if strings.HasPrefix(*httpAddr, ":") {
-		*httpAddr = s.host + *httpAddr
-	}
-	ln, err := net.Listen("tcp", *httpAddr)
-	if err != nil {
-		return util.Errorf("could not listen on %s: %s", *httpAddr, err)
-	}
-	// Obtaining the http end point listener is difficult using
-	// http.ListenAndServe(), so we are storing it with the server
-	s.httpListener = &ln
-	glog.Infof("Starting HTTP server at %s", ln.Addr())
-	go http.Serve(ln, s)
+	s.rpc.Serve(s)
 	return nil
 }
 
-func (s *server) initHTTP() {
-	s.mux.HandleFunc(adminKeyPrefix+"healthz", s.admin.handleHealthz)
-	s.mux.HandleFunc(zoneKeyPrefix, s.admin.handleZoneAction)
-	s.mux.HandleFunc(kv.KVKeyPrefix, s.kvREST.HandleAction)
-	s.mux.HandleFunc(structured.StructuredKeyPrefix, s.structuredREST.HandleAction)
+// initHTTP registers http prefixes.
+func (s *Server) initHTTP() {
+	s.mux.Handle("/", http.FileServer(
+		&assetfs.AssetFS{Asset: ui.Asset, AssetDir: ui.AssetDir}))
+
+	// The admin server handles both /debug/ and /_admin/
+	// TODO(marc): when cookie-based authentication exists,
+	// apply it for all web endpoints.
+	s.mux.Handle(adminEndpoint, s.admin)
+	s.mux.Handle(debugEndpoint, s.admin)
+	s.mux.Handle(statusKeyPrefix, s.status)
+	s.mux.Handle(ts.URLPrefix, s.tsServer)
+
+	// KV handles its own authentication, verifying user certificates against
+	// the requested user.
+	s.mux.Handle(kv.DBPrefix, s.kvDB)
+	// The SQL endpoints handles its own authentication, verifying user
+	// credentials against the requested user.
+	s.mux.Handle(sqlwire.Endpoint, s.sqlServer)
 }
 
-func (s *server) stop() {
-	// TODO(spencer): the http server should exit; this functionality is
-	// slated for go 1.3.
-	s.node.stop()
-	s.gossip.Stop()
-	s.rpc.Close()
+// startWriteSummaries begins periodically persisting status summaries for the
+// node and its stores.
+func (s *Server) startWriteSummaries() {
+	s.stopper.RunWorker(func() {
+		ticker := time.NewTicker(s.ctx.MetricsFrequency)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.stopper.RunTask(func() {
+					if err := s.writeSummaries(); err != nil {
+						log.Error(err)
+					}
+				})
+			case <-s.stopper.ShouldStop():
+				return
+			}
+		}
+	})
+}
+
+// writeSummaries retrieves status summaries from the supplied
+// NodeStatusRecorder and persists them to the cockroach data store.
+func (s *Server) writeSummaries() error {
+	nodeStatus, storeStatuses := s.recorder.GetStatusSummaries()
+	if nodeStatus != nil {
+		key := keys.NodeStatusKey(int32(nodeStatus.Desc.NodeID))
+		if err := s.db.Put(key, nodeStatus); err != nil {
+			return err
+		}
+		if log.V(1) {
+			log.Infof("recorded status for node %d", nodeStatus.Desc.NodeID)
+		}
+	}
+
+	for _, ss := range storeStatuses {
+		key := keys.StoreStatusKey(int32(ss.Desc.StoreID))
+		if err := s.db.Put(key, &ss); err != nil {
+			return err
+		}
+	}
+	if log.V(1) {
+		log.Infof("recorded status for %d stores", len(storeStatuses))
+	}
+	return nil
+}
+
+// Stop stops the server.
+func (s *Server) Stop() {
+	s.stopper.Stop()
+}
+
+// ServeHTTP is necessary to implement the http.Handler interface. It
+// will snappy a response if the appropriate request headers are set.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check if we're draining; if so return 503, service unavailable.
+	if !s.stopper.RunTask(func() {
+		// Disable caching of responses.
+		w.Header().Set("Cache-control", "no-cache")
+
+		ae := r.Header.Get(util.AcceptEncodingHeader)
+		switch {
+		case strings.Contains(ae, util.SnappyEncoding):
+			w.Header().Set(util.ContentEncodingHeader, util.SnappyEncoding)
+			s := newSnappyResponseWriter(w)
+			defer s.Close()
+			w = s
+		case strings.Contains(ae, util.GzipEncoding):
+			w.Header().Set(util.ContentEncodingHeader, util.GzipEncoding)
+			gzw := newGzipResponseWriter(w)
+			defer gzw.Close()
+			w = gzw
+		}
+		s.mux.ServeHTTP(w, r)
+	}) {
+		http.Error(w, "service is draining", http.StatusServiceUnavailable)
+	}
 }
 
 type gzipResponseWriter struct {
@@ -315,23 +308,54 @@ type gzipResponseWriter struct {
 }
 
 func newGzipResponseWriter(w http.ResponseWriter) *gzipResponseWriter {
-	gz := gzip.NewWriter(w)
+	var gz *gzip.Writer
+	if gzI := gzipWriterPool.Get(); gzI == nil {
+		gz = gzip.NewWriter(w)
+	} else {
+		gz = gzI.(*gzip.Writer)
+		gz.Reset(w)
+	}
 	return &gzipResponseWriter{WriteCloser: gz, ResponseWriter: w}
 }
 
-func (w gzipResponseWriter) Write(b []byte) (int, error) {
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.WriteCloser.Write(b)
 }
 
-// ServeHTTP is necessary to implement the http.Handler interface. It
-// will gzip a response if the appropriate request headers are set.
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		s.mux.ServeHTTP(w, r)
-		return
+func (w *gzipResponseWriter) Close() {
+	if w.WriteCloser != nil {
+		w.WriteCloser.Close()
+		gzipWriterPool.Put(w.WriteCloser)
+		w.WriteCloser = nil
 	}
-	w.Header().Set("Content-Encoding", "gzip")
-	gzw := newGzipResponseWriter(w)
-	defer gzw.Close()
-	s.mux.ServeHTTP(gzw, r)
+}
+
+type snappyResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func newSnappyResponseWriter(w http.ResponseWriter) *snappyResponseWriter {
+	var s *snappy.Writer
+	if sI := snappyWriterPool.Get(); sI == nil {
+		// TODO(pmattis): It would be better to use the C++ snappy code
+		// like rpc/codec is doing. Would have to copy the snappy.Writer
+		// implementation from snappy-go.
+		s = snappy.NewWriter(w)
+	} else {
+		s = sI.(*snappy.Writer)
+		s.Reset(w)
+	}
+	return &snappyResponseWriter{Writer: s, ResponseWriter: w}
+}
+
+func (w *snappyResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+func (w *snappyResponseWriter) Close() {
+	if w.Writer != nil {
+		snappyWriterPool.Put(w.Writer)
+		w.Writer = nil
+	}
 }

@@ -1,28 +1,24 @@
-# The resulting docker image is suitable for testing.
-# Do NOT use this docker image in a production setting.
+FROM cockroachdb/cockroach-devbase:latest
 
-FROM ubuntu
+MAINTAINER Tobias Schottdorf <tobias.schottdorf@gmail.com>
 
-FROM ubuntu:14.04
-MAINTAINER Shawn Morel <shawn@strangemonad.com>
+ENV ROACHPATH /go/src/github.com/cockroachdb
 
-# add user and group before anything
-RUN groupadd -r cockroach && useradd -r -g cockroach cockroach
+# Copy the contents of the cockroach source directory to the image.
+# Any changes which have been made to the source directory will cause
+# the docker image to be rebuilt starting at this cached step.
+ADD . ${ROACHPATH}/cockroach/
+RUN ln -s ${ROACHPATH}/cockroach/build/devbase/cockroach.sh ${ROACHPATH}/cockroach/cockroach.sh
 
-# Setup the toolchain
-RUN apt-get update
-RUN apt-get install -y build-essential
-RUN apt-get install -y curl git bzr mercurial
-RUN curl -L -s http://golang.org/dl/go1.3.linux-amd64.tar.gz | tar -v -C /usr/local/ -xz
+# Build the cockroach executable.
+RUN cd -P ${ROACHPATH}/cockroach && make build
 
-ENV PATH  /usr/local/go/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-ENV GOPATH  /go
-ENV GOROOT  /usr/local/go
+# Expose the http status port.
+EXPOSE 8080
 
-RUN mkdir -p $GOPATH/src
+# This is the command to run when this image is launched as a container.
+# Environment variable expansion doesn't seem to work here.
+ENTRYPOINT ["/go/src/github.com/cockroachdb/cockroach/cockroach.sh"]
 
-# Build cockroach (we aren't go-getable)
-RUN apt-get install -y libsnappy-dev zlib1g-dev libbz2-dev libgflags-dev
-RUN cd $GOPATH/src && git clone --depth=1 https://github.com/cockroachdb/cockroach.git
-RUN cd $GOPATH/src/cockroach && git submodule update --depth=1 --init
-RUN cd $GOPATH/src/cockroach && make
+# These are default arguments to the cockroach binary.
+CMD ["--help"]

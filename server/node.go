@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -19,17 +19,28 @@ package server
 
 import (
 	"container/list"
+	"fmt"
 	"net"
-	"strconv"
-	"sync"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
+	"github.com/cockroachdb/cockroach/multiraft"
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/server/status"
 	"github.com/cockroachdb/cockroach/storage"
+	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/tracer"
+	gogoproto "github.com/gogo/protobuf/proto"
 )
 
 const (
@@ -38,208 +49,269 @@ const (
 	gossipGroupLimit = 100
 	// gossipInterval is the interval for gossiping storage-related info.
 	gossipInterval = 1 * time.Minute
-	// ttlCapacityGossip is time-to-live for capacity-related info.
-	ttlCapacityGossip = 2 * time.Minute
-	// ttlNodeIDGossip is time-to-live for node ID -> address.
-	ttlNodeIDGossip = 0 * time.Second
+	// publishStatusInterval is the interval for publishing periodic statistics
+	// from stores to the internal event feed.
+	publishStatusInterval = 10 * time.Second
+	mb                    = 1 << 20
 )
 
-// Node manages a map of stores (by store ID) for which it serves traffic.
+// A Node manages a map of stores (by store ID) for which it serves
+// traffic. A node is the top-level data structure. There is one node
+// instance per process. A node accepts incoming RPCs and services
+// them by directing the commands contained within RPCs to local
+// stores, which in turn direct the commands to specific ranges. Each
+// node has access to the global, monolithic Key-Value abstraction via
+// its kv.DB reference. Nodes use this to allocate node and store
+// IDs for bootstrapping the node itself or new stores as they're added
+// on subsequent instantiations.
 type Node struct {
-	ClusterID  string                 // UUID for Cockroach cluster
-	Descriptor storage.NodeDescriptor // Node ID, network/physical topology
-	gossip     *gossip.Gossip         // Nodes gossip cluster ID, node ID -> host:port
-	kvDB       kv.DB                  // Used to access global id generators
-	closer     chan struct{}
-
-	mu       sync.RWMutex             // Protects storeMap during bootstrapping
-	storeMap map[int32]*storage.Store // Map from StoreID to Store
-
-	maxAvailPrefix string // Prefix for max avail capacity gossip topic
+	ClusterID  string               // UUID for Cockroach cluster
+	Descriptor proto.NodeDescriptor // Node ID, network/physical topology
+	ctx        storage.StoreContext // Context to use and pass to stores
+	lSender    *kv.LocalSender      // Local KV sender for access to node-local stores
+	feed       status.NodeEventFeed // Feed publisher for local events
+	status     *status.NodeStatusMonitor
+	startedAt  int64
 }
 
 // allocateNodeID increments the node id generator key to allocate
 // a new, unique node id.
-func allocateNodeID(db kv.DB) (int32, error) {
-	ir := <-db.Increment(&storage.IncrementRequest{
-		Key:       storage.KeyNodeIDGenerator,
-		Increment: 1,
-	})
-	if ir.Error != nil {
-		return 0, util.Errorf("unable to allocate node ID: %v", ir.Error)
+func allocateNodeID(db *client.DB) (proto.NodeID, error) {
+	r, err := db.Inc(keys.NodeIDGenerator, 1)
+	if err != nil {
+		return 0, util.Errorf("unable to allocate node ID: %s", err)
 	}
-	return int32(ir.NewValue), nil
+	return proto.NodeID(r.ValueInt()), nil
 }
 
 // allocateStoreIDs increments the store id generator key for the
 // specified node to allocate "inc" new, unique store ids. The
 // first ID in a contiguous range is returned on success.
-func allocateStoreIDs(nodeID int32, inc int64, db kv.DB) (int32, error) {
-	ir := <-db.Increment(&storage.IncrementRequest{
-		// The Key is a concatenation of StoreIDGeneratorPrefix and this node's ID.
-		Key: storage.MakeKey(storage.KeyStoreIDGeneratorPrefix,
-			[]byte(strconv.Itoa(int(nodeID)))),
-		Increment: inc,
-	})
-	if ir.Error != nil {
-		return 0, util.Errorf("unable to allocate %d store IDs for node %d: %v", inc, nodeID, ir.Error)
+func allocateStoreIDs(nodeID proto.NodeID, inc int64, db *client.DB) (proto.StoreID, error) {
+	r, err := db.Inc(keys.StoreIDGenerator, inc)
+	if err != nil {
+		return 0, util.Errorf("unable to allocate %d store IDs for node %d: %s", inc, nodeID, err)
 	}
-	return int32(ir.NewValue - inc + 1), nil
+	return proto.StoreID(r.ValueInt() - inc + 1), nil
 }
 
-// BootstrapCluster bootstraps a store using the provided engine and
-// cluster ID. The bootstrapped store contains a single range spanning
+// BootstrapCluster bootstraps a multiple stores using the provided engines and
+// cluster ID. The first bootstrapped store contains a single range spanning
 // all keys. Initial range lookup metadata is populated for the range.
 //
-// Returns a direct-access kv.LocalDB for unittest purposes only.
-func BootstrapCluster(clusterID string, engine storage.Engine) (*kv.LocalDB, error) {
-	sIdent := storage.StoreIdent{
-		ClusterID: clusterID,
-		NodeID:    1,
-		StoreID:   1,
-	}
-	s := storage.NewStore(engine, nil)
-	defer s.Close()
-
-	// Verify the store isn't already part of a cluster.
-	if s.Ident.ClusterID != "" {
-		return nil, util.Errorf("storage engine already belongs to a cluster (%s)", s.Ident.ClusterID)
-	}
-
-	// Bootstrap store to persist the store ident.
-	if err := s.Bootstrap(sIdent); err != nil {
+// Returns a KV client for unittest purposes. Caller should close the returned
+// client.
+func BootstrapCluster(clusterID string, engines []engine.Engine, stopper *stop.Stopper) (*client.DB, error) {
+	ctx := storage.StoreContext{}
+	ctx.ScanInterval = 10 * time.Minute
+	ctx.Clock = hlc.NewClock(hlc.UnixNano)
+	// Create a KV DB with a local sender.
+	lSender := kv.NewLocalSender()
+	sender := kv.NewTxnCoordSender(lSender, ctx.Clock, false, nil, stopper)
+	var err error
+	if ctx.DB, err = client.Open("//root@", client.SenderOpt(sender)); err != nil {
 		return nil, err
 	}
+	ctx.Transport = multiraft.NewLocalRPCTransport()
+	for i, eng := range engines {
+		sIdent := proto.StoreIdent{
+			ClusterID: clusterID,
+			NodeID:    1,
+			StoreID:   proto.StoreID(i + 1),
+		}
 
-	if err := s.Init(); err != nil {
-		return nil, err
-	}
+		// The bootstrapping store will not connect to other nodes so its
+		// StoreConfig doesn't really matter.
+		s := storage.NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 
-	// Create first range.
-	replica := storage.Replica{
-		NodeID:  1,
-		StoreID: 1,
-		RangeID: 1,
-		Attrs:   storage.Attributes{},
-	}
-	rng, err := s.CreateRange(storage.KeyMin, storage.KeyMax, []storage.Replica{replica})
-	if err != nil {
-		return nil, err
-	}
-	if rng.Meta.RangeID != 1 {
-		return nil, util.Errorf("expected range id of 1, got %d", rng.Meta.RangeID)
-	}
+		// Verify the store isn't already part of a cluster.
+		if len(s.Ident.ClusterID) > 0 {
+			return nil, util.Errorf("storage engine already belongs to a cluster (%s)", s.Ident.ClusterID)
+		}
 
-	// Create a local DB to directly modify the new range.
-	localDB := kv.NewLocalDB(rng)
+		// Bootstrap store to persist the store ident.
+		if err := s.Bootstrap(sIdent, stopper); err != nil {
+			return nil, err
+		}
+		// Create first range, writing directly to engine. Note this does
+		// not create the range, just its data.  Only do this if this is the
+		// first store.
+		if i == 0 {
+			if err := s.BootstrapRange(); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.Start(stopper); err != nil {
+			return nil, err
+		}
 
-	// Initialize range addressing records and default administrative configs.
-	if err := kv.BootstrapRangeDescriptor(localDB, replica); err != nil {
-		return nil, err
-	}
-	if err := kv.BootstrapConfigs(localDB); err != nil {
-		return nil, err
-	}
+		lSender.AddStore(s)
 
-	// Initialize node and store ids after the fact to account
-	// for use of node ID = 1 and store ID = 1.
-	if nodeID, err := allocateNodeID(localDB); nodeID != sIdent.NodeID || err != nil {
-		return nil, util.Errorf("expected to intialize node id allocator to %d, got %d: %v",
-			sIdent.NodeID, nodeID, err)
+		// Initialize node and store ids.  Only initialize the node once.
+		if i == 0 {
+			if nodeID, err := allocateNodeID(ctx.DB); nodeID != sIdent.NodeID || err != nil {
+				return nil, util.Errorf("expected to initialize node id allocator to %d, got %d: %s",
+					sIdent.NodeID, nodeID, err)
+			}
+		}
+		if storeID, err := allocateStoreIDs(sIdent.NodeID, 1, ctx.DB); storeID != sIdent.StoreID || err != nil {
+			return nil, util.Errorf("expected to initialize store id allocator to %d, got %d: %s",
+				sIdent.StoreID, storeID, err)
+		}
 	}
-	if storeID, err := allocateStoreIDs(sIdent.NodeID, 1, localDB); storeID != sIdent.StoreID || err != nil {
-		return nil, util.Errorf("expected to intialize store id allocator to %d, got %d: %v",
-			sIdent.StoreID, storeID, err)
-	}
-
-	return localDB, nil
+	return ctx.DB, nil
 }
 
-// NewNode returns a new instance of Node, interpreting command line
-// flags to initialize the appropriate Store or set of
-// Stores. Registers the storage instance for the RPC service "Node".
-func NewNode(kvDB kv.DB, gossip *gossip.Gossip) *Node {
-	n := &Node{
-		gossip:   gossip,
-		kvDB:     kvDB,
-		storeMap: make(map[int32]*storage.Store),
-		closer:   make(chan struct{}),
-	}
-	return n
-}
-
-// initDescriptor initializes the physical/network topology attributes
-// if possible. Datacenter, PDU & Rack values are taken from environment
-// variables or command line flags.
-func (n *Node) initDescriptor(addr net.Addr, attrs storage.Attributes) {
-	n.Descriptor = storage.NodeDescriptor{
-		// NodeID is after invocation of start()
-		Address: addr,
-		Attrs:   attrs,
+// NewNode returns a new instance of Node.
+func NewNode(ctx storage.StoreContext) *Node {
+	return &Node{
+		ctx:     ctx,
+		status:  status.NewNodeStatusMonitor(),
+		lSender: kv.NewLocalSender(),
 	}
 }
 
-// start starts the node by initializing network/physical topology
-// attributes gleaned from the environment and initializing stores
-// for each specified engine. Launches periodic store gossipping
-// in a goroutine.
-func (n *Node) start(rpcServer *rpc.Server, engines []storage.Engine,
-	attrs storage.Attributes) error {
+// context returns a context encapsulating the NodeID.
+func (n *Node) context() context.Context {
+	return log.Add(context.Background(), log.NodeID, n.Descriptor.NodeID)
+}
+
+// initDescriptor initializes the node descriptor with the server
+// address and the node attributes.
+func (n *Node) initDescriptor(addr net.Addr, attrs proto.Attributes) {
+	n.Descriptor.Address = proto.Addr{
+		Network: addr.Network(),
+		Address: addr.String(),
+	}
+	n.Descriptor.Attrs = attrs
+}
+
+// initNodeID updates the internal NodeDescriptor with the given ID. If zero is
+// supplied, a new NodeID is allocated with the first invocation. For all other
+// values, the supplied ID is stored into the descriptor (unless one has been
+// set previously, in which case a fatal error occurs).
+//
+// Upon setting a new NodeID, the descriptor is gossiped and the NodeID is
+// stored into the gossip instance.
+func (n *Node) initNodeID(id proto.NodeID) {
+	if id < 0 {
+		log.Fatalf("NodeID must not be negative")
+	}
+
+	if o := n.Descriptor.NodeID; o > 0 {
+		if id == 0 {
+			return
+		}
+		log.Fatalf("cannot initialize NodeID to %d, already have %d", id, o)
+	}
+	var err error
+	if id == 0 {
+		id, err = allocateNodeID(n.ctx.DB)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if id == 0 {
+			log.Fatal("new node allocated illegal ID 0")
+		}
+
+	}
+	// Gossip the node descriptor to make this node addressable by node ID.
+	n.Descriptor.NodeID = id
+	log.Infof("new node allocated ID %d", n.Descriptor.NodeID)
+	if err = n.ctx.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
+		log.Fatalf("couldn't gossip descriptor for node %d: %s", n.Descriptor.NodeID, err)
+	}
+}
+
+// start starts the node by registering the storage instance for the
+// RPC service "Node" and initializing stores for each specified
+// engine. Launches periodic store gossiping in a goroutine.
+func (n *Node) start(rpcServer *rpc.Server, engines []engine.Engine,
+	attrs proto.Attributes, stopper *stop.Stopper) error {
 	n.initDescriptor(rpcServer.Addr(), attrs)
-	rpcServer.RegisterName("Node", n)
+	requests := []proto.Request{
+		&proto.GetRequest{},
+		&proto.PutRequest{},
+		&proto.ConditionalPutRequest{},
+		&proto.IncrementRequest{},
+		&proto.DeleteRequest{},
+		&proto.DeleteRangeRequest{},
+		&proto.ScanRequest{},
+		&proto.EndTransactionRequest{},
+		&proto.AdminSplitRequest{},
+		&proto.AdminMergeRequest{},
+		&proto.InternalRangeLookupRequest{},
+		&proto.InternalHeartbeatTxnRequest{},
+		&proto.InternalGCRequest{},
+		&proto.InternalPushTxnRequest{},
+		&proto.InternalResolveIntentRequest{},
+		&proto.InternalResolveIntentRangeRequest{},
+		&proto.InternalMergeRequest{},
+		&proto.InternalTruncateLogRequest{},
+		&proto.InternalLeaderLeaseRequest{},
+	}
+	for _, r := range requests {
+		if err := rpcServer.Register("Node."+r.Method().String(), n.executeCmd, r); err != nil {
+			log.Fatalf("unable to register node service with RPC server: %s", err)
+		}
+	}
 
-	if err := n.initStoreMap(engines); err != nil {
+	// Start status monitor.
+	n.status.StartMonitorFeed(n.ctx.EventFeed)
+	stopper.AddCloser(n.ctx.EventFeed)
+
+	// Initialize stores, including bootstrapping new ones.
+	if err := n.initStores(engines, stopper); err != nil {
 		return err
 	}
-	go n.startGossip()
 
+	n.startedAt = n.ctx.Clock.Now().WallTime
+
+	// Initialize publisher for Node Events. This requires the NodeID, which is
+	// initialized by initStores(); because of this, some Store initialization
+	// events will precede the StartNodeEvent on the feed.
+	n.feed = status.NewNodeEventFeed(n.Descriptor.NodeID, n.ctx.EventFeed)
+	n.feed.StartNode(n.Descriptor, n.startedAt)
+
+	n.startPublishStatuses(stopper)
+	n.startGossip(stopper)
+	log.Infoc(n.context(), "Started node with %v engine(s) and attributes %v", engines, attrs.Attrs)
 	return nil
 }
 
-// stop cleanly stops the node.
-func (n *Node) stop() {
-	close(n.closer)
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	for _, store := range n.storeMap {
-		store.Close()
-	}
-}
-
-// initStoreMap initializes the Stores map from id to Store. Stores are
-// added to the storeMap if the Store is already bootstrapped. A
-// bootstrapped Store has a valid ident with cluster, node and Store
-// IDs set. If the Store doesn't yet have a valid ident, it's added to
-// the bootstraps list for initialization once the cluster and node
-// IDs have been determined.
-func (n *Node) initStoreMap(engines []storage.Engine) error {
+// initStores initializes the Stores map from id to Store. Stores are
+// added to the local sender if already bootstrapped. A bootstrapped
+// Store has a valid ident with cluster, node and Store IDs set. If
+// the Store doesn't yet have a valid ident, it's added to the
+// bootstraps list for initialization once the cluster and node IDs
+// have been determined.
+func (n *Node) initStores(engines []engine.Engine, stopper *stop.Stopper) error {
 	bootstraps := list.New()
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	for _, engine := range engines {
-		s := storage.NewStore(engine, n.gossip)
-		// If not bootstrapped, add to list.
-		if !s.IsBootstrapped() {
-			bootstraps.PushBack(s)
-			continue
-		}
-		// Otherwise, initialize each store in turn.
-		if err := s.Init(); err != nil {
-			return err
-		}
-		if s.Ident.ClusterID != "" {
-			if s.Ident.StoreID == 0 {
-				return util.Error("cluster id set for node ident but missing store id")
+	if len(engines) == 0 {
+		return util.Error("no engines")
+	}
+	for _, e := range engines {
+		s := storage.NewStore(n.ctx, e, &n.Descriptor)
+		// Initialize each store in turn, handling un-bootstrapped errors by
+		// adding the store to the bootstraps list.
+		if err := s.Start(stopper); err != nil {
+			if _, ok := err.(*storage.NotBootstrappedError); ok {
+				log.Infof("store %s not bootstrapped", s)
+				bootstraps.PushBack(s)
+				continue
 			}
-			capacity, err := s.Capacity()
-			if err != nil {
-				return err
-			}
-			glog.Infof("initialized store %s: %+v", s, capacity)
-			n.storeMap[s.Ident.StoreID] = s
+			return util.Errorf("failed to start store: %s", err)
 		}
+		if s.Ident.ClusterID == "" || s.Ident.NodeID == 0 {
+			return util.Errorf("unidentified store: %s", s)
+		}
+		capacity, err := s.Capacity()
+		if err != nil {
+			return util.Errorf("could not query store capacity: %s", err)
+		}
+		log.Infof("initialized store %s: %+v", s, capacity)
+		n.lSender.AddStore(s)
 	}
 
 	// Verify all initialized stores agree on cluster and node IDs.
@@ -251,9 +323,17 @@ func (n *Node) initStoreMap(engines []storage.Engine) error {
 	// to the gossip network is necessary to get the cluster ID.
 	n.connectGossip()
 
+	// If no NodeID has been assigned yet, allocate a new node ID by
+	// supplying 0 to initNodeID.
+	if n.Descriptor.NodeID == 0 {
+		n.initNodeID(0)
+	}
+
 	// Bootstrap any uninitialized stores asynchronously.
 	if bootstraps.Len() > 0 {
-		go n.bootstrapStores(bootstraps)
+		stopper.RunAsyncTask(func() {
+			n.bootstrapStores(bootstraps, stopper)
+		})
 	}
 
 	return nil
@@ -263,278 +343,156 @@ func (n *Node) initStoreMap(engines []storage.Engine) error {
 // cluster ID and node ID. The node's ident is initialized based on
 // the agreed-upon cluster and node IDs.
 func (n *Node) validateStores() error {
-	for _, s := range n.storeMap {
-		if s.Ident.ClusterID == "" || s.Ident.NodeID == 0 {
-			return util.Errorf("unidentified store in store map: %s", s)
-		}
+	return n.lSender.VisitStores(func(s *storage.Store) error {
 		if n.ClusterID == "" {
 			n.ClusterID = s.Ident.ClusterID
-			n.Descriptor.NodeID = s.Ident.NodeID
+			n.initNodeID(s.Ident.NodeID)
 		} else if n.ClusterID != s.Ident.ClusterID {
 			return util.Errorf("store %s cluster ID doesn't match node cluster %q", s, n.ClusterID)
 		} else if n.Descriptor.NodeID != s.Ident.NodeID {
 			return util.Errorf("store %s node ID doesn't match node ID: %d", s, n.Descriptor.NodeID)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // bootstrapStores bootstraps uninitialized stores once the cluster
 // and node IDs have been established for this node. Store IDs are
 // allocated via a sequence id generator stored at a system key per
 // node.
-func (n *Node) bootstrapStores(bootstraps *list.List) {
-	glog.Infof("bootstrapping %d store(s)", bootstraps.Len())
-
-	// Allocate a new node ID if necessary.
-	if n.Descriptor.NodeID == 0 {
-		var err error
-		n.Descriptor.NodeID, err = allocateNodeID(n.kvDB)
-		glog.Infof("new node allocated ID %d", n.Descriptor.NodeID)
-		if err != nil {
-			glog.Fatal(err)
-		}
-		// Gossip node address keyed by node ID.
-		nodeIDKey := gossip.MakeNodeIDGossipKey(n.Descriptor.NodeID)
-		if err := n.gossip.AddInfo(nodeIDKey, n.Descriptor.Address, ttlNodeIDGossip); err != nil {
-			glog.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
-		}
+func (n *Node) bootstrapStores(bootstraps *list.List, stopper *stop.Stopper) {
+	log.Infof("bootstrapping %d store(s)", bootstraps.Len())
+	if n.ClusterID == "" {
+		panic("ClusterID missing during store bootstrap of auxiliary store")
 	}
 
 	// Bootstrap all waiting stores by allocating a new store id for
 	// each and invoking store.Bootstrap() to persist.
 	inc := int64(bootstraps.Len())
-	firstID, err := allocateStoreIDs(n.Descriptor.NodeID, inc, n.kvDB)
+	firstID, err := allocateStoreIDs(n.Descriptor.NodeID, inc, n.ctx.DB)
 	if err != nil {
-		glog.Fatal(err)
+		log.Fatal(err)
 	}
-	sIdent := storage.StoreIdent{
+	sIdent := proto.StoreIdent{
 		ClusterID: n.ClusterID,
 		NodeID:    n.Descriptor.NodeID,
 		StoreID:   firstID,
 	}
 	for e := bootstraps.Front(); e != nil; e = e.Next() {
 		s := e.Value.(*storage.Store)
-		s.Bootstrap(sIdent)
-		n.mu.Lock()
-		n.storeMap[s.Ident.StoreID] = s
-		n.mu.Unlock()
+		if err := s.Bootstrap(sIdent, stopper); err != nil {
+			log.Fatal(err)
+		}
+		if err := s.Start(stopper); err != nil {
+			log.Fatal(err)
+		}
+		n.lSender.AddStore(s)
 		sIdent.StoreID++
-		glog.Infof("bootstrapped store %s", s)
+		log.Infof("bootstrapped store %s", s)
+		// Done regularly in Node.startGossip, but this cuts down the time
+		// until this store is used for range allocations.
+		s.GossipCapacity()
 	}
 }
 
 // connectGossip connects to gossip network and reads cluster ID. If
 // this node is already part of a cluster, the cluster ID is verified
 // for a match. If not part of a cluster, the cluster ID is set. The
-// node's address is gossipped with node ID as the gossip key.
+// node's address is gossiped with node ID as the gossip key.
 func (n *Node) connectGossip() {
-	glog.Infof("connecting to gossip network to verify cluster ID...")
-	<-n.gossip.Connected
+	log.Infof("connecting to gossip network to verify cluster ID...")
+	// No timeout or stop condition is needed here. Log statements should be
+	// sufficient for diagnosing this type of condition.
+	<-n.ctx.Gossip.Connected
 
-	val, err := n.gossip.GetInfo(gossip.KeyClusterID)
+	val, err := n.ctx.Gossip.GetInfo(gossip.KeyClusterID)
 	if err != nil || val == nil {
-		glog.Fatalf("unable to ascertain cluster ID from gossip network: %v", err)
+		log.Fatalf("unable to ascertain cluster ID from gossip network: %s", err)
 	}
 	gossipClusterID := val.(string)
 
 	if n.ClusterID == "" {
 		n.ClusterID = gossipClusterID
 	} else if n.ClusterID != gossipClusterID {
-		glog.Fatalf("node %d belongs to cluster %q but is attempting to connect to a gossip network for cluster %q",
+		log.Fatalf("node %d belongs to cluster %q but is attempting to connect to a gossip network for cluster %q",
 			n.Descriptor.NodeID, n.ClusterID, gossipClusterID)
 	}
-	glog.Infof("node connected via gossip and verified as part of cluster %q", gossipClusterID)
-
-	// Gossip node address keyed by node ID.
-	if n.Descriptor.NodeID != 0 {
-		nodeIDKey := gossip.MakeNodeIDGossipKey(n.Descriptor.NodeID)
-		if err := n.gossip.AddInfo(nodeIDKey, n.Descriptor.Address, ttlNodeIDGossip); err != nil {
-			glog.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
-		}
-	}
+	log.Infof("node connected via gossip and verified as part of cluster %q", gossipClusterID)
 }
 
 // startGossip loops on a periodic ticker to gossip node-related
-// information. Loops until the node is closed and should be
-// invoked via goroutine.
-func (n *Node) startGossip() {
-	ticker := time.NewTicker(gossipInterval)
-	for {
-		select {
-		case <-ticker.C:
-			n.gossipCapacities()
-		case <-n.closer:
-			ticker.Stop()
-			return
+// information. Starts a goroutine to loop until the node is closed.
+func (n *Node) startGossip(stopper *stop.Stopper) {
+	stopper.RunWorker(func() {
+		ticker := time.NewTicker(gossipInterval)
+		defer ticker.Stop()
+		n.gossipCapacities() // one-off run before going to sleep
+		for {
+			select {
+			case <-ticker.C:
+				n.gossipCapacities()
+			case <-stopper.ShouldStop():
+				return
+			}
 		}
-	}
+	})
 }
 
 // gossipCapacities calls capacity on each store and adds it to the
 // gossip network.
 func (n *Node) gossipCapacities() {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+	// will never error because `return nil` below
+	_ = n.lSender.VisitStores(func(s *storage.Store) error {
+		s.GossipCapacity()
+		return nil
+	})
+}
 
-	for _, store := range n.storeMap {
-		storeDesc, err := store.Descriptor(&n.Descriptor)
-		if err != nil {
-			glog.Warningf("problem getting store descriptor for store %+v: %v", store.Ident, err)
-			continue
+// startPublishStatuses starts a loop which periodically instructs each store to
+// publish its current status to the event feed.
+func (n *Node) startPublishStatuses(stopper *stop.Stopper) {
+	stopper.RunWorker(func() {
+		// Publish status at the same frequency as metrics are collected.
+		ticker := time.NewTicker(publishStatusInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := n.publishStoreStatuses()
+				if err != nil {
+					log.Error(err)
+				}
+			case <-stopper.ShouldStop():
+				return
+			}
 		}
-		gossipPrefix := gossip.KeyMaxAvailCapacityPrefix + storeDesc.CombinedAttrs().SortedString()
-		keyMaxCapacity := gossipPrefix + strconv.FormatInt(int64(storeDesc.Node.NodeID), 10) + "-" +
-			strconv.FormatInt(int64(storeDesc.StoreID), 10)
-		// Register gossip group.
-		n.gossip.RegisterGroup(gossipPrefix, gossipGroupLimit, gossip.MaxGroup)
-		// Gossip store descriptor.
-		n.gossip.AddInfo(keyMaxCapacity, *storeDesc, ttlCapacityGossip)
-	}
+	})
 }
 
-// storeCount returns the number of stores this node is exporting.
-func (n *Node) getStoreCount() int {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return len(n.storeMap)
+// publishStoreStatuses calls publishStatus on each store on the node.
+func (n *Node) publishStoreStatuses() error {
+	return n.lSender.VisitStores(func(store *storage.Store) error {
+		return store.PublishStatus()
+	})
 }
 
-// getRange looks up the store by Replica.StoreID and then queries it for
-// the range specified by Replica.RangeID.
-func (n *Node) getRange(r *storage.Replica) (*storage.Range, error) {
-	n.mu.RLock()
-	store, ok := n.storeMap[r.StoreID]
-	n.mu.RUnlock()
-	if !ok {
-		return nil, util.Errorf("store for replica %+v not found", r)
-	}
-	rng, err := store.GetRange(r.RangeID)
-	if err != nil {
-		return nil, err
-	}
-	return rng, nil
-}
+// executeCmd creates a proto.Call struct and sends it via our local sender.
+func (n *Node) executeCmd(argsI gogoproto.Message) (gogoproto.Message, error) {
+	args := argsI.(proto.Request)
+	reply := args.CreateReply()
+	// TODO(tschottdorf) get a hold of the client's ID, add it to the
+	// context before dispatching, and create an ID for tracing the request.
+	header := args.Header()
+	header.CmdID = header.GetOrCreateCmdID(n.ctx.Clock.PhysicalNow())
+	trace := n.ctx.Tracer.NewTrace(header)
+	defer trace.Finalize()
+	defer trace.Epoch("node")()
+	ctx := tracer.ToCtx((*Node)(n).context(), trace)
 
-// All methods to satisfy the Node RPC service fetch the range
-// based on the Replica target provided in the argument header.
-// Commands are broken down into read-only and read-write and
-// sent along to the range via either Range.readOnlyCmd() or
-// Range.readWriteCmd().
-
-// Contains .
-func (n *Node) Contains(args *storage.ContainsRequest, reply *storage.ContainsResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
+	n.lSender.Send(ctx, proto.Call{Args: args, Reply: reply})
+	n.feed.CallComplete(args, reply)
+	if err := reply.Header().GoError(); err != nil {
+		trace.Event(fmt.Sprintf("error: %T", err))
 	}
-	return rng.ReadOnlyCmd("Contains", args, reply)
-}
-
-// Get .
-func (n *Node) Get(args *storage.GetRequest, reply *storage.GetResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return rng.ReadOnlyCmd("Get", args, reply)
-}
-
-// Put .
-func (n *Node) Put(args *storage.PutRequest, reply *storage.PutResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("Put", args, reply)
-}
-
-// Increment .
-func (n *Node) Increment(args *storage.IncrementRequest, reply *storage.IncrementResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("Increment", args, reply)
-}
-
-// Delete .
-func (n *Node) Delete(args *storage.DeleteRequest, reply *storage.DeleteResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("Delete", args, reply)
-}
-
-// DeleteRange .
-func (n *Node) DeleteRange(args *storage.DeleteRangeRequest, reply *storage.DeleteRangeResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("DeleteRange", args, reply)
-}
-
-// Scan .
-func (n *Node) Scan(args *storage.ScanRequest, reply *storage.ScanResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return rng.ReadOnlyCmd("Scan", args, reply)
-}
-
-// EndTransaction .
-func (n *Node) EndTransaction(args *storage.EndTransactionRequest, reply *storage.EndTransactionResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("EndTransaction", args, reply)
-}
-
-// AccumulateTS .
-func (n *Node) AccumulateTS(args *storage.AccumulateTSRequest, reply *storage.AccumulateTSResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("AccumulateTS", args, reply)
-}
-
-// ReapQueue .
-func (n *Node) ReapQueue(args *storage.ReapQueueRequest, reply *storage.ReapQueueResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("ReapQueue", args, reply)
-}
-
-// EnqueueUpdate .
-func (n *Node) EnqueueUpdate(args *storage.EnqueueUpdateRequest, reply *storage.EnqueueUpdateResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("EnqueueUpdate", args, reply)
-}
-
-// EnqueueMessage .
-func (n *Node) EnqueueMessage(args *storage.EnqueueMessageRequest, reply *storage.EnqueueMessageResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return <-rng.ReadWriteCmd("EnqueueMessage", args, reply)
-}
-
-// InternalRangeLookup .
-func (n *Node) InternalRangeLookup(args *storage.InternalRangeLookupRequest, reply *storage.InternalRangeLookupResponse) error {
-	rng, err := n.getRange(&args.Replica)
-	if err != nil {
-		return err
-	}
-	return rng.ReadOnlyCmd("InternalRangeLookup", args, reply)
+	return reply, nil
 }

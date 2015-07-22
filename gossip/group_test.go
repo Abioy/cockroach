@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func newTestInfo(key string, val interface{}) *info {
@@ -41,27 +42,33 @@ func newTestInfo(key string, val interface{}) *info {
 // TestMinGroupShouldInclude tests MinGroup type groups
 // and group.shouldInclude() behavior.
 func TestMinGroupShouldInclude(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 2, MinGroup)
 
 	// First two inserts work fine.
 	info1 := newTestInfo("a.a", int64(1))
-	if err := group.addInfo(info1); err != nil {
+	if _, err := group.addInfo(info1); err != nil {
 		t.Error(err)
 	}
 	info2 := newTestInfo("a.b", int64(2))
-	if err := group.addInfo(info2); err != nil {
+	if _, err := group.addInfo(info2); err != nil {
 		t.Error(err)
 	}
 
 	// A smaller insert should include fine.
 	info3 := newTestInfo("a.c", int64(0))
-	if !group.shouldInclude(info3) || group.addInfo(info3) != nil {
+	if !group.shouldInclude(info3) {
 		t.Error("could not insert")
 	}
-
+	if _, err := group.addInfo(info3); err != nil {
+		t.Errorf("could not insert: %s", err)
+	}
 	// A larger insert shouldn't include.
 	info4 := newTestInfo("a.d", int64(3))
-	if group.shouldInclude(info4) || group.addInfo(info4) == nil {
+	if group.shouldInclude(info4) {
+		t.Error("shouldn't have been able to insert")
+	}
+	if _, err := group.addInfo(info4); err == nil {
 		t.Error("shouldn't have been able to insert")
 	}
 }
@@ -69,27 +76,34 @@ func TestMinGroupShouldInclude(t *testing.T) {
 // TestMaxGroupShouldInclude tests MaxGroup type groups and
 // group.shouldInclude() behavior.
 func TestMaxGroupShouldInclude(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 2, MaxGroup)
 
 	// First two inserts work fine.
 	info1 := newTestInfo("a.a", int64(1))
-	if err := group.addInfo(info1); err != nil {
+	if _, err := group.addInfo(info1); err != nil {
 		t.Error(err)
 	}
 	info2 := newTestInfo("a.b", int64(2))
-	if err := group.addInfo(info2); err != nil {
+	if _, err := group.addInfo(info2); err != nil {
 		t.Error(err)
 	}
 
 	// A larger insert should include fine.
 	info3 := newTestInfo("a.c", int64(3))
-	if !group.shouldInclude(info3) || group.addInfo(info3) != nil {
+	if !group.shouldInclude(info3) {
 		t.Errorf("could not insert")
+	}
+	if _, err := group.addInfo(info3); err != nil {
+		t.Errorf("could not insert: %s", err)
 	}
 
 	// A smaller insert shouldn't include.
 	info4 := newTestInfo("a.d", int64(0))
-	if group.shouldInclude(info4) || group.addInfo(info4) == nil {
+	if group.shouldInclude(info4) {
+		t.Error("shouldn't have been able to insert")
+	}
+	if _, err := group.addInfo(info4); err == nil {
 		t.Error("shouldn't have been able to insert")
 	}
 }
@@ -97,9 +111,10 @@ func TestMaxGroupShouldInclude(t *testing.T) {
 // TestTypeMismatch inserts two infos of different types into a group
 // and verifies error response.
 func TestTypeMismatch(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 1, MinGroup)
 	info1 := newTestInfo("a.a", int64(1))
-	if err := group.addInfo(info1); err != nil {
+	if _, err := group.addInfo(info1); err != nil {
 		t.Error(err)
 	}
 	info2 := &info{
@@ -108,7 +123,7 @@ func TestTypeMismatch(t *testing.T) {
 		Timestamp: info1.Timestamp,
 		TTLStamp:  info1.TTLStamp,
 	}
-	if err := group.addInfo(info2); err == nil {
+	if _, err := group.addInfo(info2); err == nil {
 		t.Error("expected error inserting string info into float64 group")
 	}
 }
@@ -116,76 +131,94 @@ func TestTypeMismatch(t *testing.T) {
 // TestSameKeyInserts inserts the same key into group and verifies
 // earlier timestamps are ignored and later timestamps always replace it.
 func TestSameKeyInserts(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 1, MinGroup)
 	info1 := newTestInfo("a.a", int64(1))
-	if err := group.addInfo(info1); err != nil {
+	changed, err := group.addInfo(info1)
+	if err != nil {
 		t.Error(err)
+	}
+	if !changed {
+		t.Error("expected changed contents to be true on first insert")
 	}
 
 	// Smaller timestamp should be ignored.
 	info2 := newTestInfo("a.a", int64(1))
 	info2.Timestamp = info1.Timestamp - 1
-	if err := group.addInfo(info2); err == nil {
+	if _, err := group.addInfo(info2); err == nil {
 		t.Error("should not allow insert")
 	}
 
 	// Two successively larger timestamps always win.
 	info3 := newTestInfo("a.a", int64(1))
 	info3.Timestamp = info1.Timestamp + 1
-	if err := group.addInfo(info3); err != nil {
+	changed, err = group.addInfo(info3)
+	if err != nil {
 		t.Error(err)
 	}
-	info4 := newTestInfo("a.a", int64(1))
+	if changed {
+		t.Error("expected changed to be false on successive timestamp but same value")
+	}
+	info4 := newTestInfo("a.a", int64(2)) // change value
 	info4.Timestamp = info1.Timestamp + 2
-	if err := group.addInfo(info4); err != nil {
+	changed, err = group.addInfo(info4)
+	if err != nil {
 		t.Error(err)
+	}
+	if !changed {
+		t.Error("expected changed to be true on successive timestamp with different value")
 	}
 }
 
 // TestGroupCompactAfterTTL verifies group compaction after TTL by
 // waiting and verifying a full group can be inserted into again.
 func TestGroupCompactAfterTTL(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 2, MinGroup)
 
 	// First two inserts work fine.
 	info1 := newTestInfo("a.a", int64(1))
-	info1.TTLStamp = info1.Timestamp + int64(time.Millisecond)
-	if err := group.addInfo(info1); err != nil {
+	info1.TTLStamp = info1.Timestamp + int64(5*time.Millisecond)
+	if _, err := group.addInfo(info1); err != nil {
 		t.Error(err)
 	}
 	info2 := newTestInfo("a.b", int64(2))
-	info2.TTLStamp = info2.Timestamp + int64(time.Millisecond)
-	if err := group.addInfo(info2); err != nil {
+	info2.TTLStamp = info2.Timestamp + int64(5*time.Millisecond)
+	if _, err := group.addInfo(info2); err != nil {
 		t.Error(err)
 	}
 
 	// A larger insert shouldn't yet insert as we haven't surprassed TTL.
 	info3 := newTestInfo("a.c", int64(3))
-	if err := group.addInfo(info3); err == nil {
+	if _, err := group.addInfo(info3); err == nil {
 		t.Error("shouldn't be able to insert")
 	}
 
-	// Now, wait a millisecond and try again.
-	time.Sleep(time.Millisecond)
-	if err := group.addInfo(info3); err != nil {
+	// Now, wait for the TTL and try again.
+	time.Sleep(5 * time.Millisecond)
+	if _, err := group.addInfo(info3); err != nil {
 		t.Error(err)
 	}
 
 	// Next value should also insert.
 	info4 := newTestInfo("a.d", int64(4))
-	if err := group.addInfo(info4); err != nil {
+	if _, err := group.addInfo(info4); err != nil {
 		t.Error(err)
 	}
 }
 
 // insertRandomInfos inserts random values into group and returns
 // a slice of info objects.
-func insertRandomInfos(g *group, count int) infoSlice {
+func insertRandomInfos(t *testing.T, g *group, count int) infoSlice {
 	infos := make(infoSlice, count)
 
 	for i := 0; i < count; i++ {
-		infos[i] = newTestInfo(fmt.Sprintf("a.%d", i), rand.Float64())
-		g.addInfo(infos[i])
+		info := newTestInfo(fmt.Sprintf("a.%d", i), rand.Float64())
+
+		// we don't care if this errors
+		_, _ = g.addInfo(info)
+
+		infos[i] = info
 	}
 
 	return infos
@@ -194,14 +227,16 @@ func insertRandomInfos(g *group, count int) infoSlice {
 // TestGroups100Keys verifies behavior of MinGroup and MaxGroup with a
 // limit of 100 keys after inserting 1000.
 func TestGroups100Keys(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	// Start by adding random infos to min group.
 	minGroup := newGroup("a", 100, MinGroup)
-	infos := insertRandomInfos(minGroup, 1000)
+	infos := insertRandomInfos(t, minGroup, 1000)
 
 	// Insert same infos into the max group.
 	maxGroup := newGroup("a", 100, MaxGroup)
 	for _, i := range infos {
-		maxGroup.addInfo(i)
+		// we don't care if this errors
+		_, _ = maxGroup.addInfo(i)
 	}
 	sort.Sort(infos)
 
@@ -227,14 +262,15 @@ func TestGroups100Keys(t *testing.T) {
 // information. We don't want each new update with overlap to generate
 // unnecessary delta info.
 func TestSameKeySameTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	group := newGroup("a", 2, MinGroup)
 	info1 := newTestInfo("a.a", float64(1.0))
 	info2 := newTestInfo("a.a", float64(1.0))
 	info2.Timestamp = info1.Timestamp
-	if err := group.addInfo(info1); err != nil {
+	if _, err := group.addInfo(info1); err != nil {
 		t.Error(err)
 	}
-	if err := group.addInfo(info2); err == nil {
+	if _, err := group.addInfo(info2); err == nil {
 		t.Error("second insert with identical key & timestamp should have failed")
 	}
 }
@@ -242,6 +278,7 @@ func TestSameKeySameTimestamp(t *testing.T) {
 // TestSameKeyDifferentHops verifies that adding two infos with the
 // same key and different Hops values preserves the lower Hops count.
 func TestSameKeyDifferentHops(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	info1 := newTestInfo("a.a", float64(1.0))
 	info2 := newTestInfo("a.a", float64(1.0))
 	info1.Hops = 1
@@ -250,10 +287,10 @@ func TestSameKeyDifferentHops(t *testing.T) {
 
 	// Add info1 first, then info2.
 	group1 := newGroup("a", 1, MinGroup)
-	if err := group1.addInfo(info1); err != nil {
-		t.Errorf("failed insert: %s", err)
+	if changed, err := group1.addInfo(info1); err != nil || !changed {
+		t.Errorf("failed insert: %s, %t", err, changed)
 	}
-	if err := group1.addInfo(info2); err == nil {
+	if _, err := group1.addInfo(info2); err == nil {
 		t.Errorf("shouldn't have inserted info 2: %s", err)
 	}
 
@@ -263,8 +300,13 @@ func TestSameKeyDifferentHops(t *testing.T) {
 
 	// Add info2 first, then info1.
 	group2 := newGroup("a", 1, MinGroup)
-	if err1, err2 := group2.addInfo(info2), group2.addInfo(info1); err1 != nil || err2 != nil {
-		t.Errorf("failed insertions: %s, %s", err1, err2)
+	if changed, err := group2.addInfo(info2); err != nil || !changed {
+		t.Errorf("failed insert: %s, %t", err, changed)
+	}
+	// Since they have the same values, contentsChanged will be false,
+	// despite the addInfo working.
+	if changed, err := group2.addInfo(info1); err != nil || changed {
+		t.Errorf("failed insert: %s, %t", err, changed)
 	}
 	if i := group2.getInfo("a.a"); i == nil || i.Hops != 1 {
 		t.Error("info nil or info.Hops != 1:", i)
@@ -273,8 +315,9 @@ func TestSameKeyDifferentHops(t *testing.T) {
 
 // TestGroupGetInfo verifies info selection by key.
 func TestGroupGetInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	g := newGroup("a", 10, MinGroup)
-	infos := insertRandomInfos(g, 10)
+	infos := insertRandomInfos(t, g, 10)
 	for _, i := range infos {
 		if i != g.getInfo(i.Key) {
 			t.Error("could not fetch info", i)
@@ -289,10 +332,13 @@ func TestGroupGetInfo(t *testing.T) {
 
 // TestGroupGetInfoTTL verifies GetInfo with a short TTL.
 func TestGroupGetInfoTTL(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	g := newGroup("a", 10, MinGroup)
 	i := newTestInfo("a.a", int64(1))
 	i.TTLStamp = i.Timestamp + int64(time.Nanosecond)
-	g.addInfo(i)
+	if _, err := g.addInfo(i); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(time.Nanosecond)
 	if g.getInfo(i.Key) != nil {
 		t.Error("shouldn't have been able to fetch key with short TTL")
@@ -303,13 +349,21 @@ func TestGroupGetInfoTTL(t *testing.T) {
 	info1 := newTestInfo("a.1", int64(1))
 	info2 := newTestInfo("a.2", int64(2))
 	info2.TTLStamp = i.Timestamp + int64(time.Nanosecond)
-	g.addInfo(info1)
-	g.addInfo(info2)
+	if _, err := g.addInfo(info1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.addInfo(info2); err != nil {
+		t.Fatal(err)
+	}
 
+	// Wait until info2 is expired.
 	time.Sleep(time.Nanosecond)
 	infos := g.infosAsSlice()
 	if len(infos) != 1 || infos[0].Val != info1.Val {
 		t.Error("only one info should be returned", infos)
+	}
+	if g.gatekeeper == nil || g.gatekeeper.Val != info1.Val {
+		t.Error("gatekeeper should have been updated", g.gatekeeper)
 	}
 }
 
@@ -325,13 +379,20 @@ func (t *testValue) Less(o util.Ordered) bool {
 // TestGroupWithStructVal verifies group operation with a value which
 // is not a basic supported type.
 func TestGroupWithStructVal(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	g := newGroup("a", 10, MinGroup)
 	i1 := newTestInfo("a.a", &testValue{3, "a"})
 	i2 := newTestInfo("a.b", &testValue{1, "b"})
 	i3 := newTestInfo("a.c", &testValue{2, "c"})
-	g.addInfo(i1)
-	g.addInfo(i2)
-	g.addInfo(i3)
+	if _, err := g.addInfo(i1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.addInfo(i2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.addInfo(i3); err != nil {
+		t.Fatal(err)
+	}
 
 	infos := g.infosAsSlice()
 	if infos[0].Val != i2.Val || infos[1].Val != i3.Val || infos[2].Val != i1.Val {
